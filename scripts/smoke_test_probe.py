@@ -12,7 +12,12 @@ Verifies:
 """
 
 import sys
-sys.path.insert(0, '/Users/saurabhbhadada/Desktop/current/research/padic-transformers')
+import os
+
+# Add project root to path (works both locally and in Docker)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.insert(0, project_root)
 
 import torch
 import numpy as np
