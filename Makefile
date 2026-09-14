@@ -1,4 +1,4 @@
-.PHONY: help build up down shell jupyter tensorboard train eval test download clean logs
+.PHONY: help build up down shell jupyter tensorboard train eval test download clean logs probe-smoke probe-exp1 probe-quick
 
 # Project configuration
 PROJECT_NAME := padic-transformers
@@ -29,6 +29,11 @@ help:
 	@echo "  make download       - Download datasets"
 	@echo "  make train CONFIG=<path>  - Train model with config"
 	@echo "  make eval CKPT=<path>     - Evaluate checkpoint"
+	@echo ""
+	@echo "Experiments:"
+	@echo "  make probe-smoke    - Run smoke test for p-adic probe"
+	@echo "  make probe-exp1     - Run Experiment 1 (2000 samples, 1000 pairs)"
+	@echo "  make probe-quick    - Quick probe test (200 samples, 100 pairs)"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make clean          - Clean up Docker resources"
@@ -158,6 +163,31 @@ eval-mmlu:
 eval-math:
 	@echo "Evaluating on math benchmarks..."
 	$(DOCKER_RUN) python scripts/evaluate.py --checkpoint $(CKPT) --benchmarks math,gsm8k
+
+# Experiment 1: P-adic structure probe
+probe-smoke:
+	@echo "Running smoke test for p-adic probe..."
+	$(DOCKER_RUN) python scripts/smoke_test_probe.py
+
+probe-exp1:
+	@echo "Running Experiment 1: P-adic structure probe on WikiText"
+	@echo "  Model: pythia-1b, Layer: 6"
+	@echo "  Samples: 2000, Pairs per head: 1000, Bootstrap: 1000"
+	@mkdir -p results
+	$(DOCKER_RUN) python scripts/probe_kv_structure.py \
+		--num-samples 2000 \
+		--num-pairs 1000 \
+		--n-bootstrap 1000 \
+		--output results/probe_wikitext_layer6_1M.json
+
+probe-quick:
+	@echo "Running quick probe test (200 samples, 100 pairs)..."
+	@mkdir -p results
+	$(DOCKER_RUN) python scripts/probe_kv_structure.py \
+		--num-samples 200 \
+		--num-pairs 100 \
+		--n-bootstrap 100 \
+		--output results/probe_quick.json
 
 # Leaderboard submission
 submit-openllm:
