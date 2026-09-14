@@ -233,7 +233,7 @@ def test_scale_sharing():
             # Collect all keys for this head
             all_keys_for_head = []
             for seq_id in range(len(keys)):
-                key_tensor = keys[seq_id][0]  # [heads, seq, dim]
+                key_tensor = keys[seq_id][0].squeeze(0)  # [heads, seq, dim] - remove batch dim
                 K_head = key_tensor[head_idx]  # [seq, dim]
                 all_keys_for_head.append(K_head)
 
