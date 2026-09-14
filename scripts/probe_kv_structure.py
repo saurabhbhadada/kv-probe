@@ -39,9 +39,7 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
-from scipy.stats import pearsonr, spearmanr, spearmanr
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics import silhouette_score
+from scipy.stats import spearmanr
 
 from src.kernels import _padic_valuation
 
@@ -121,11 +119,58 @@ def compute_cosine_similarity(k1, k2):
     return torch.nn.functional.cosine_similarity(k1_flat, k2_flat, dim=0).item()
 
 
-def compute_padic_statistics(k1, k2, precision=16, prime=2, scale_factor=None):
+def compute_quantization_scale(keys_all, precision=16):
     """
-    Compute p-adic statistics between two tensors.
+    Compute ONE fixed quantization scale for all keys in a layer/head.
 
-    CRITICAL: Traditional min(v_p) is degenerate in high dimensions!
+    CRITICAL: The integer representation of a key must NOT depend on which
+    other key it is compared against. All keys must use the same scale.
+
+    Args:
+        keys_all: All key vectors for this layer/head [num_samples, dim]
+        precision: Bit precision
+
+    Returns:
+        scale: Fixed quantization scale to use for all keys
+    """
+    # Find max absolute value across ALL keys
+    max_abs = keys_all.abs().max().item()
+
+    if max_abs < 1e-8:
+        return 1.0
+
+    # Symmetric quantization: map to [-2^(p-1), 2^(p-1)]
+    int_range = 2 ** (precision - 1)
+    scale = int_range / max_abs
+
+    return scale
+
+
+def quantize_keys_fixed_scale(keys, scale, precision=16):
+    """
+    Quantize keys using a FIXED pre-computed scale.
+
+    Args:
+        keys: Key vectors to quantize [N, dim]
+        scale: Pre-computed fixed scale
+        precision: Bit precision
+
+    Returns:
+        keys_int: Quantized keys
+    """
+    keys_float = keys.float()
+    keys_int = torch.round(keys_float * scale).to(torch.int64)
+    return keys_int
+
+
+def compute_padic_statistics_fixed_scale(k1_int, k2_int, precision=16, prime=2):
+    """
+    Compute p-adic statistics between two PRE-QUANTIZED integer tensors.
+
+    CRITICAL: Uses FIXED scale quantization - keys already quantized with
+    shared scale, so integer representation doesn't depend on pair.
+
+    Traditional min(v_p) is degenerate in high dimensions!
     For 256-D vectors, P(min > 0) ≈ (1/2)^256 ≈ 0, making the metric flat.
 
     We compute robust S_k statistics instead:
@@ -137,10 +182,9 @@ def compute_padic_statistics(k1, k2, precision=16, prime=2, scale_factor=None):
     - High S_k => many dimensions have shared p-adic structure
 
     Args:
-        k1, k2: Tensors to compare (shape: [dim])
-        precision: Bit precision for quantization
+        k1_int, k2_int: Pre-quantized integer tensors (shape: [dim])
+        precision: Bit precision (for capping valuations)
         prime: Prime for p-adic metric (2, 3, 5, etc.)
-        scale_factor: Optional fixed scale (for control experiments)
 
     Returns:
         dict with:
@@ -149,36 +193,6 @@ def compute_padic_statistics(k1, k2, precision=16, prime=2, scale_factor=None):
         - S_k: fraction of dims with v_p >= k for k=1,2,3,4
         - valuations: full per-dimension valuations
     """
-    # Convert to float32 to avoid FP16 overflow
-    k1 = k1.float()
-    k2 = k2.float()
-
-    # Symmetric quantization: map to [-2^(p-1), 2^(p-1)]
-    max_abs = max(k1.abs().max().item(), k2.abs().max().item())
-
-    if max_abs < 1e-8:
-        # Both tensors are nearly zero
-        dim = k1.numel()
-        return {
-            'min_valuation': precision,
-            'mean_valuation': precision,
-            'S1': 1.0,
-            'S2': 1.0,
-            'S3': 1.0,
-            'S4': 1.0,
-            'valuations': torch.full((dim,), precision),
-        }
-
-    # Use provided scale or compute from precision
-    if scale_factor is None:
-        int_range = 2 ** (precision - 1)
-        scale = int_range / max_abs
-    else:
-        scale = scale_factor
-
-    # Quantize to integers
-    k1_int = torch.round(k1 * scale).to(torch.int64)
-    k2_int = torch.round(k2 * scale).to(torch.int64)
 
     # Compute difference
     diff = k1_int - k2_int
@@ -211,6 +225,56 @@ def compute_padic_statistics(k1, k2, precision=16, prime=2, scale_factor=None):
     }
 
 
+def generate_pair_manifest(keys, attentions, num_pairs, future_horizon=64, seed=42):
+    """
+    Generate ONE fixed manifest of (seq_id, head, i, j) pairs to analyze.
+
+    CRITICAL: Must use the SAME pairs for all metrics (S_k, cosine, Euclidean,
+    different primes, different precisions, permutation control, etc.)
+
+    Otherwise differences between methods could come from different sampled pairs.
+
+    Args:
+        keys: List of key tensors per sequence
+        attentions: List of attention tensors per sequence
+        num_pairs: Total number of pairs to sample
+        future_horizon: Number of future queries required
+        seed: Random seed for reproducibility
+
+    Returns:
+        List of (seq_id, head, i, j) tuples
+    """
+    np.random.seed(seed)
+    pairs = []
+
+    num_heads = keys[0][0].shape[0]
+
+    while len(pairs) < num_pairs:
+        # Sample random sequence
+        seq_idx = np.random.randint(len(keys))
+        key_tensor = keys[seq_idx][0]  # [heads, seq, dim]
+
+        seq_len = key_tensor.shape[1]
+
+        # Sample two positions
+        if seq_len < 2:
+            continue
+
+        i, j = np.random.choice(seq_len, size=2, replace=False)
+
+        # Check if we have enough future context
+        future_start = max(i, j) + 1
+        if future_start + future_horizon > seq_len:
+            continue  # Not enough future context
+
+        # Sample random head
+        head_idx = np.random.randint(num_heads)
+
+        pairs.append((seq_idx, head_idx, i, j))
+
+    return pairs[:num_pairs]
+
+
 def generate_random_baseline(keys):
     """
     Generate random tensors with same marginal distribution as real keys.
@@ -234,490 +298,296 @@ def generate_random_baseline(keys):
     return random_keys
 
 
-def analyze_distance_correlations_cpu(keys, attentions, num_pairs=500, prime=2, precision=16, scale_factor=None):
-    """CPU version: Analyze each attention head separately."""
+def compute_all_statistics_fixed_pairs(keys, attentions, pair_manifest, prime, precision, future_horizon, quantization_scales, use_permuted=False):
+    """
+    Compute statistics for all pairs in the manifest using FIXED quantization.
+
+    Args:
+        keys: List of key tensors [seq][batch=1, heads, seq, dim]
+        attentions: List of attention tensors [seq][batch=1, heads, seq, seq]
+        pair_manifest: List of (seq_id, head, i, j) tuples
+        prime: Prime for p-adic
+        precision: Bit precision
+        future_horizon: Number of future queries to use
+        quantization_scales: Dict[(seq_id, head, precision)] -> scale
+        use_permuted: If True, permute keys across positions (null control)
+
+    Returns:
+        dict with arrays of: euclidean, cosine, S1, S2, S3, S4, attention_sim
+    """
     euclidean_dists = []
     cosine_sims = []
-    padic_min = []
-    padic_mean = []
-    padic_S1 = []
-    padic_S2 = []
-    padic_S3 = []
-    padic_S4 = []
+    S1_vals = []
+    S2_vals = []
+    S3_vals = []
+    S4_vals = []
     attention_sims = []
-    head_ids = []
 
-    print(f"  Using CPU implementation (p={prime}, precision={precision})")
-    print(f"  Computing robust S_k statistics (fraction of dims with v_p >= k)")
+    # Pre-quantize and optionally permute all keys
+    quantized_keys = {}
+    for seq_id in range(len(keys)):
+        key_tensor = keys[seq_id][0]  # [heads, seq, dim]
+        num_heads, seq_len, dim = key_tensor.shape
 
-    # Get number of heads
-    num_heads = keys[0][0].shape[0]
+        for head in range(num_heads):
+            K_head = key_tensor[head]  # [seq, dim]
 
-    for _ in tqdm(range(num_pairs), desc="Sampling pairs"):
-        # Sample random sequence and two positions
-        seq_idx = np.random.randint(len(keys))
-        key_tensor = keys[seq_idx][0]  # [heads, seq, dim] - take first batch
+            # Optionally permute keys across positions (null control)
+            if use_permuted:
+                perm = torch.randperm(seq_len)
+                K_head = K_head[perm]
 
-        seq_len = key_tensor.shape[1]
-        if seq_len < 2:
-            continue
-
-        # Sample two positions
-        i, j = np.random.choice(seq_len, size=2, replace=False)
-
-        # Only consider future positions (causal masking)
-        future_start = max(i, j) + 1
-        if future_start >= seq_len:
-            continue  # No future positions
-
-        attn = attentions[seq_idx][0]  # [heads, seq, seq]
-
-        # Analyze EACH HEAD separately
-        for head_idx in range(num_heads):
-            # Extract key vectors for this head
-            ki = key_tensor[head_idx, i, :]  # [dim]
-            kj = key_tensor[head_idx, j, :]  # [dim]
-
-            # Compute distances
-            euclidean_dists.append(compute_euclidean_distance(ki, kj))
-            cosine_sims.append(compute_cosine_similarity(ki, kj))
-
-            # Compute p-adic statistics (robust + traditional)
-            padic_stats = compute_padic_statistics(ki, kj, precision=precision, prime=prime, scale_factor=scale_factor)
-            padic_min.append(padic_stats['min_valuation'])
-            padic_mean.append(padic_stats['mean_valuation'])
-            padic_S1.append(padic_stats['S1'])
-            padic_S2.append(padic_stats['S2'])
-            padic_S3.append(padic_stats['S3'])
-            padic_S4.append(padic_stats['S4'])
-
-            # Compute attention similarity for this head (COLUMNS)
-            # A[head, future_start:, i] = how future queries attend to key i in this head
-            attn_col_i = attn[head_idx, future_start:, i]
-            attn_col_j = attn[head_idx, future_start:, j]
-
-            if len(attn_col_i) > 0 and len(attn_col_j) > 0:
-                attn_sim = torch.nn.functional.cosine_similarity(
-                    attn_col_i, attn_col_j, dim=0
-                ).item()
-                attention_sims.append(attn_sim)
-                head_ids.append(head_idx)
+            # Get fixed scale
+            scale_key = (seq_id, head, precision)
+            if scale_key in quantization_scales:
+                scale = quantization_scales[scale_key]
             else:
-                # Remove the measurements we just added
-                euclidean_dists.pop()
-                cosine_sims.pop()
-                padic_min.pop()
-                padic_mean.pop()
-                padic_S1.pop()
-                padic_S2.pop()
-                padic_S3.pop()
-                padic_S4.pop()
+                # Compute scale if not cached
+                scale = compute_quantization_scale(K_head, precision)
+                quantization_scales[scale_key] = scale
+
+            # Quantize once with fixed scale
+            K_int = quantize_keys_fixed_scale(K_head, scale, precision)
+            quantized_keys[(seq_id, head)] = K_int
+
+    # Process each pair
+    for seq_id, head, i, j in tqdm(pair_manifest, desc=f"p={prime}, prec={precision}, perm={use_permuted}"):
+        K_int = quantized_keys[(seq_id, head)]  # [seq, dim]
+        key_tensor = keys[seq_id][0]  # [heads, seq, dim]
+        attn_tensor = attentions[seq_id][0]  # [heads, seq, seq]
+
+        # Extract key vectors (float for Euclidean/cosine)
+        ki_float = key_tensor[head, i, :]
+        kj_float = key_tensor[head, j, :]
+
+        # Euclidean distance
+        euclidean_dists.append(compute_euclidean_distance(ki_float, kj_float))
+
+        # Cosine similarity
+        cosine_sims.append(compute_cosine_similarity(ki_float, kj_float))
+
+        # P-adic statistics (using pre-quantized integers)
+        ki_int = K_int[i]
+        kj_int = K_int[j]
+        padic_stats = compute_padic_statistics_fixed_scale(ki_int, kj_int, precision, prime)
+
+        S1_vals.append(padic_stats['S1'])
+        S2_vals.append(padic_stats['S2'])
+        S3_vals.append(padic_stats['S3'])
+        S4_vals.append(padic_stats['S4'])
+
+        # Attention similarity (COLUMNS, fixed future horizon)
+        future_start = max(i, j) + 1
+        attn_col_i = attn_tensor[head, future_start:future_start+future_horizon, i]
+        attn_col_j = attn_tensor[head, future_start:future_start+future_horizon, j]
+
+        attn_sim = torch.nn.functional.cosine_similarity(
+            attn_col_i, attn_col_j, dim=0
+        ).item()
+        attention_sims.append(attn_sim)
 
     return {
-        'euclidean': euclidean_dists,
-        'cosine': cosine_sims,
-        'padic_min': padic_min,
-        'padic_mean': padic_mean,
-        'padic_S1': padic_S1,
-        'padic_S2': padic_S2,
-        'padic_S3': padic_S3,
-        'padic_S4': padic_S4,
-        'attention': attention_sims,
-        'heads': head_ids,
+        'euclidean': np.array(euclidean_dists),
+        'cosine': np.array(cosine_sims),
+        'S1': np.array(S1_vals),
+        'S2': np.array(S2_vals),
+        'S3': np.array(S3_vals),
+        'S4': np.array(S4_vals),
+        'attention': np.array(attention_sims),
     }
 
 
-def analyze_distance_correlations_gpu(keys, attentions, num_pairs=500, prime=2, precision=16, scale_factor=None):
-    """GPU version: Analyze each attention head separately."""
-    euclidean_dists = []
-    cosine_sims = []
-    padic_min = []
-    padic_mean = []
-    padic_S1 = []
-    padic_S2 = []
-    padic_S3 = []
-    padic_S4 = []
-    attention_sims = []
-    head_ids = []
-
-    print(f"  Using GPU implementation (p={prime}, precision={precision})")
-    print(f"  Computing robust S_k statistics (fraction of dims with v_p >= k)")
-
-    # Get GPU device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Get number of heads
-    num_heads = keys[0][0].shape[0]
-
-    # Process each sequence
-    sequences_to_process = min(len(keys), 20)  # Sample from first 20 sequences
-    pairs_per_seq = num_pairs // (sequences_to_process * num_heads)
-
-    for seq_idx in tqdm(range(sequences_to_process), desc="Processing sequences"):
-        key_tensor = keys[seq_idx][0].to(device)  # [heads, seq, dim]
-        attn_tensor = attentions[seq_idx][0].to(device)  # [heads, seq, seq]
-
-        seq_len = key_tensor.shape[1]
-        if seq_len < 2:
-            continue
-
-        # Process EACH HEAD separately
-        for head_idx in range(num_heads):
-            K = key_tensor[head_idx]  # [seq, dim] for this head
-            A = attn_tensor[head_idx]  # [seq, seq] for this head
-
-            # Compute ALL pairwise distances on GPU (cdist requires float32)
-            K_float32 = K.to(torch.float32)
-            dists_euc = torch.cdist(K_float32.unsqueeze(0), K_float32.unsqueeze(0)).squeeze(0)
-
-            # Cosine similarity matrix (for keys)
-            K_norm = torch.nn.functional.normalize(K, dim=1)
-            cosine_matrix = torch.mm(K_norm, K_norm.t())
-
-            # Sample pairs from this sequence/head
-            actual_pairs = min(pairs_per_seq, seq_len * (seq_len - 1) // 2)
-
-            for _ in range(actual_pairs):
-                i, j = np.random.choice(seq_len, size=2, replace=False)
-
-                # Only use pairs where we have future context
-                future_start = max(i, j) + 1
-                if future_start >= seq_len:
-                    continue
-
-                # Lookup key similarity
-                euclidean_dists.append(dists_euc[i, j].item())
-                cosine_sims.append(cosine_matrix[i, j].item())
-
-                # Compute attention column similarity (how future queries attend to these keys)
-                attn_col_i = A[future_start:, i]
-                attn_col_j = A[future_start:, j]
-
-                if len(attn_col_i) > 0:
-                    attn_col_i_norm = torch.nn.functional.normalize(attn_col_i.unsqueeze(0), dim=1)
-                    attn_col_j_norm = torch.nn.functional.normalize(attn_col_j.unsqueeze(0), dim=1)
-                    attn_sim = torch.mm(attn_col_i_norm, attn_col_j_norm.t()).item()
-                    attention_sims.append(attn_sim)
-                else:
-                    continue
-
-                # P-adic statistics (CPU only, but just for sampled pairs)
-                ki = K[i].cpu()
-                kj = K[j].cpu()
-                padic_stats = compute_padic_statistics(ki, kj, precision=precision, prime=prime, scale_factor=scale_factor)
-                padic_min.append(padic_stats['min_valuation'])
-                padic_mean.append(padic_stats['mean_valuation'])
-                padic_S1.append(padic_stats['S1'])
-                padic_S2.append(padic_stats['S2'])
-                padic_S3.append(padic_stats['S3'])
-                padic_S4.append(padic_stats['S4'])
-                head_ids.append(head_idx)
-
-    return {
-        'euclidean': euclidean_dists,
-        'cosine': cosine_sims,
-        'padic_min': padic_min,
-        'padic_mean': padic_mean,
-        'padic_S1': padic_S1,
-        'padic_S2': padic_S2,
-        'padic_S3': padic_S3,
-        'padic_S4': padic_S4,
-        'attention': attention_sims,
-        'heads': head_ids,
-    }
-
-
-def bootstrap_correlation_ci(x, y, n_bootstrap=1000, ci=95):
+def bootstrap_correlation_difference(x1, x2, y, pair_manifest, n_bootstrap=1000, ci=95):
     """
-    Compute bootstrap confidence interval for correlation.
+    Bootstrap the DIFFERENCE between two Spearman correlations.
 
-    CRITICAL LIMITATION: Measurements aren't independent - many pairs share
-    sequences/tokens. This bootstrap uses naive resampling, which may
-    underestimate variance.
+    CRITICAL: Bootstrap delta directly, not separate CIs.
 
-    IDEAL: Resample at sequence level, recompute pairs, then correlations.
-    But that requires refactoring the analysis pipeline.
+    Uses sequence-level resampling: sample sequences with replacement,
+    include all pairs from sampled sequences.
 
-    For publication: Consider this a lower bound on CI width. Real uncertainty
-    is likely larger due to dependencies.
+    Args:
+        x1, x2: Two metrics to compare (e.g., S2 and cosine)
+        y: Target (attention similarity)
+        pair_manifest: List of (seq_id, head, i, j)
+        n_bootstrap: Number of bootstrap iterations
+        ci: Confidence level
+
+    Returns:
+        (delta, ci_lower, ci_upper)
     """
-    correlations = []
-    n = len(x)
+    # Get unique sequence IDs
+    seq_ids = list(set([seq_id for seq_id, _, _, _ in pair_manifest]))
+    n_seqs = len(seq_ids)
+
+    deltas = []
 
     for _ in range(n_bootstrap):
-        # Resample with replacement (naive - ignores dependencies)
-        indices = np.random.choice(n, size=n, replace=True)
-        x_boot = x[indices]
-        y_boot = y[indices]
+        # Resample sequences with replacement
+        boot_seqs = np.random.choice(seq_ids, size=n_seqs, replace=True)
 
-        # Compute correlation on bootstrap sample
-        r_boot, _ = pearsonr(x_boot, y_boot)
-        correlations.append(r_boot)
+        # Get indices of pairs from sampled sequences
+        boot_indices = []
+        for s in boot_seqs:
+            indices = [idx for idx, (seq_id, _, _, _) in enumerate(pair_manifest) if seq_id == s]
+            boot_indices.extend(indices)
 
-    # Compute confidence interval
+        if len(boot_indices) < 10:  # Need enough pairs
+            continue
+
+        # Compute correlations on bootstrap sample (use Spearman)
+        rho1, _ = spearmanr(x1[boot_indices], y[boot_indices])
+        rho2, _ = spearmanr(x2[boot_indices], y[boot_indices])
+
+        delta = rho1 - rho2
+        deltas.append(delta)
+
+    # Compute CI
     lower_percentile = (100 - ci) / 2
     upper_percentile = 100 - lower_percentile
 
-    ci_lower = np.percentile(correlations, lower_percentile)
-    ci_upper = np.percentile(correlations, upper_percentile)
+    ci_lower = np.percentile(deltas, lower_percentile)
+    ci_upper = np.percentile(deltas, upper_percentile)
 
-    return ci_lower, ci_upper
+    # Mean delta
+    delta_mean = np.mean(deltas)
 
-
-def run_single_analysis(keys, attentions, num_pairs, prime, precision, scale_factor, use_gpu):
-    """Run analysis with specific parameters, returns per-head results."""
-    if use_gpu and torch.cuda.is_available():
-        try:
-            return analyze_distance_correlations_gpu(keys, attentions, num_pairs, prime, precision, scale_factor)
-        except Exception:
-            return analyze_distance_correlations_cpu(keys, attentions, num_pairs, prime, precision, scale_factor)
-    else:
-        return analyze_distance_correlations_cpu(keys, attentions, num_pairs, prime, precision, scale_factor)
+    return delta_mean, ci_lower, ci_upper
 
 
-def analyze_K_structure(kv_states, layer_idx=6, num_pairs=500, use_gpu=True):
+def analyze_K_structure(kv_states, layer_idx=6, num_pairs=500, future_horizon=64, seed=42):
     """
-    Probe for p-adic structure in KEYS only (not values).
+    Probe for p-adic structure in KEYS with 5 CORE FIXES:
 
-    SCOPE: This probes K similarity vs K behavior, NOT KV jointly.
-    A separate probe for V is needed to test value structure.
-
-    Research question:
-    Does p-adic distance between keys K[i] and K[j] predict
-    how similarly they are attended to by future queries?
-
-    Specifically:
-    - Key distance: ||K[i] - K[j]|| or d_p(K[i], K[j])
-    - Key behavior: similarity of A[:, i] and A[:, j]
-      (how future queries attend to key i vs key j)
-
-    NOT comparing Q[i] vs Q[j] (that would be attention ROWS, wrong!)
-
-    ANALYSIS PER ATTENTION HEAD:
-    - Each attention head operates in its own learned subspace
-    - Averaging across heads is mathematically questionable
-    - We analyze each head separately and aggregate statistics
-    - This can reveal head-specific ultrametric structure
-
-    INCLUDES CRITICAL CONTROLS FOR FP16 CONFOUNDS:
-    - Random baseline (same distribution as real keys)
-    - Multiple primes (p=2, 3, 5)
-    - Multiple precisions (8, 12, 16 bit)
+    1. Fixed quantization scale per layer/head
+    2. Spearman for all comparisons, bootstrap delta directly
+    3. Reuse exact same pair manifest everywhere
+    4. Fixed future-attention horizon
+    5. Token-permutation null control
 
     Args:
         kv_states: Extracted KV cache states
         layer_idx: Layer to analyze
         num_pairs: Number of pairs to sample
-        use_gpu: Try GPU-accelerated version (fallback to CPU on error)
+        future_horizon: Number of future queries for attention similarity
+        seed: Random seed for pair manifest
 
     Returns:
-        dict with correlation results, CIs, per-head stats
+        dict with correlation results
     """
     print(f"\n{'='*80}")
-    print(f"Analyzing Layer {layer_idx} (Per-Head, S_k Statistics)")
+    print(f"Layer {layer_idx}: Fixed-Scale, Same-Pairs, Spearman Analysis")
     print(f"{'='*80}")
+    print(f"Pairs: {num_pairs}, Future horizon: {future_horizon}, Seed: {seed}")
 
     # Extract keys and attention for this layer
     keys = [sample[layer_idx] for sample in kv_states['keys']]
     attentions = [sample[layer_idx] for sample in kv_states['attention_weights']]
 
-    # Generate random baseline
-    print("\nGenerating random baseline (same distribution as real keys)...")
-    random_keys = generate_random_baseline(keys)
+    # FIX 3: Generate ONE fixed pair manifest (reused everywhere)
+    print("\n[1/5] Generating fixed pair manifest...")
+    pair_manifest = generate_pair_manifest(keys, attentions, num_pairs, future_horizon, seed)
+    print(f"  Generated {len(pair_manifest)} pairs (seed={seed})")
 
-    # Run analysis for REAL keys
-    print(f"\n{'='*80}")
-    print("REAL TRANSFORMER KEYS")
-    print(f"{'='*80}")
+    # FIX 1: Pre-compute quantization scales per (seq, head, precision)
+    print("\n[2/5] Pre-computing quantization scales...")
+    quantization_scales = {}
+    for precision in [8, 12, 16]:
+        for seq_id in range(len(keys)):
+            key_tensor = keys[seq_id][0]  # [heads, seq, dim]
+            num_heads = key_tensor.shape[0]
+            for head in range(num_heads):
+                K_head = key_tensor[head]  # [seq, dim]
+                scale = compute_quantization_scale(K_head, precision)
+                quantization_scales[(seq_id, head, precision)] = scale
+    print(f"  Computed {len(quantization_scales)} scales")
 
     results = {}
 
-    # Test multiple primes
-    for prime in [2, 3, 5]:
-        print(f"\n--- Prime p={prime} ---")
-        stats = run_single_analysis(keys, attentions, num_pairs, prime, 16, None, use_gpu)
+    # Test p=2 (primary)
 
-        euc_arr = np.array(stats['euclidean'])
-        cos_arr = np.array(stats['cosine'])
-        att_arr = np.array(stats['attention'])
-        heads_arr = np.array(stats['heads'])
+    print("\n[3/5] Computing statistics for p=2, precision=16...")
+    prime = 2
+    precision = 16
 
-        # P-adic statistics (robust + traditional)
-        padic_min_arr = np.array(stats['padic_min'])
-        padic_mean_arr = np.array(stats['padic_mean'])
-        S1_arr = np.array(stats['padic_S1'])
-        S2_arr = np.array(stats['padic_S2'])
-        S3_arr = np.array(stats['padic_S3'])
-        S4_arr = np.array(stats['padic_S4'])
+    # Real keys
+    stats_real = compute_all_statistics_fixed_pairs(
+        keys, attentions, pair_manifest, prime, precision, future_horizon,
+        quantization_scales, use_permuted=False
+    )
 
-        # Compute both Pearson and Spearman (v_p is discrete and heavily tied)
-        # Pearson for Euclidean/Cosine
-        euc_corr_p, _ = pearsonr(-euc_arr, att_arr)
-        cos_corr_p, _ = pearsonr(cos_arr, att_arr)
+    # FIX 5: Permutation null control
+    print("\n[4/5] Computing permutation null control...")
+    stats_perm = compute_all_statistics_fixed_pairs(
+        keys, attentions, pair_manifest, prime, precision, future_horizon,
+        quantization_scales, use_permuted=True
+    )
 
-        # Spearman for discrete p-adic statistics
-        min_corr_s, _ = spearmanr(padic_min_arr, att_arr)
-        mean_corr_s, _ = spearmanr(padic_mean_arr, att_arr)
-        S1_corr_s, _ = spearmanr(S1_arr, att_arr)
-        S2_corr_s, _ = spearmanr(S2_arr, att_arr)
-        S3_corr_s, _ = spearmanr(S3_arr, att_arr)
-        S4_corr_s, _ = spearmanr(S4_arr, att_arr)
+    # FIX 2: Use Spearman consistently
+    print("\n[5/5] Computing Spearman correlations and bootstrapping delta...")
+    att = stats_real['attention']
 
-        # Bootstrap CI for key comparison: S2 vs Cosine
-        print(f"Overall (Pearson for continuous, Spearman for discrete):")
-        print(f"  Euclidean: r_p={euc_corr_p:.4f}")
-        print(f"  Cosine:    r_p={cos_corr_p:.4f}")
-        print(f"  P-adic min(v_p):  r_s={min_corr_s:.4f} (degenerate in 256-D)")
-        print(f"  P-adic mean(v_p): r_s={mean_corr_s:.4f}")
-        print(f"  S_1 (≥1 digits):  r_s={S1_corr_s:.4f}")
-        print(f"  S_2 (≥2 digits):  r_s={S2_corr_s:.4f}")
-        print(f"  S_3 (≥3 digits):  r_s={S3_corr_s:.4f}")
-        print(f"  S_4 (≥4 digits):  r_s={S4_corr_s:.4f}")
+    rho_S2_real, _ = spearmanr(stats_real['S2'], att)
+    rho_cos_real, _ = spearmanr(stats_real['cosine'], att)
+    rho_S2_perm, _ = spearmanr(stats_perm['S2'], att)
 
-        # Bootstrap confidence interval for S2 vs Cosine difference
-        S2_ci_lower, S2_ci_upper = bootstrap_correlation_ci(S2_arr, att_arr, n_bootstrap=1000)
-        cos_ci_lower, cos_ci_upper = bootstrap_correlation_ci(cos_arr, att_arr, n_bootstrap=1000)
+    # Bootstrap delta directly
+    delta, ci_lower, ci_upper = bootstrap_correlation_difference(
+        stats_real['S2'], stats_real['cosine'], att, pair_manifest, n_bootstrap=1000
+    )
 
-        print(f"  S_2 bootstrap 95% CI: [{S2_ci_lower:.4f}, {S2_ci_upper:.4f}]")
-        print(f"  Cosine bootstrap 95% CI: [{cos_ci_lower:.4f}, {cos_ci_upper:.4f}]")
+    print(f"\n{'='*80}")
+    print("RESULTS (p=2, 16-bit)")
+    print('='*80)
+    print(f"Number of pairs: {len(pair_manifest)}")
+    print(f"\nSpearman correlations:")
+    print(f"  rho_S2 (real):       {rho_S2_real:.4f}")
+    print(f"  rho_cosine (real):   {rho_cos_real:.4f}")
+    print(f"  rho_S2 (permuted):   {rho_S2_perm:.4f}")
+    print(f"\nDifference (S2 - Cosine):")
+    print(f"  delta_rho:           {delta:.4f}")
+    print(f"  95% bootstrap CI:    [{ci_lower:.4f}, {ci_upper:.4f}]")
+    print(f"\nNull control:")
+    print(f"  real - permuted:     {rho_S2_real - rho_S2_perm:.4f}")
 
-        # Report difference with approximate CI
-        diff = S2_corr_s - cos_corr_p
-        diff_ci_lower = S2_ci_lower - cos_ci_upper  # Conservative estimate
-        diff_ci_upper = S2_ci_upper - cos_ci_lower
-        print(f"  S_2 - Cosine: {diff:.4f}, 95% CI ≈ [{diff_ci_lower:.4f}, {diff_ci_upper:.4f}]")
+    results['p2_prec16'] = {
+        'num_pairs': len(pair_manifest),
+        'rho_S2': rho_S2_real,
+        'rho_cosine': rho_cos_real,
+        'rho_S2_permuted': rho_S2_perm,
+        'delta_rho': delta,
+        'delta_ci': (ci_lower, ci_upper),
+        'real_minus_permuted': rho_S2_real - rho_S2_perm,
+    }
 
-        # Per-head breakdown (using best robust statistic)
-        num_heads = int(heads_arr.max()) + 1
-        per_head_S2 = []
-        for h in range(num_heads):
-            mask = heads_arr == h
-            if mask.sum() > 10:  # Need at least 10 samples
-                h_S2_corr, _ = pearsonr(S2_arr[mask], att_arr[mask])
-                per_head_S2.append(h_S2_corr)
-            else:
-                per_head_S2.append(np.nan)
+    # Test other primes if time permits
+    for prime in [3, 5]:
+        print(f"\n--- Prime p={prime} (16-bit) ---")
+        stats_p = compute_all_statistics_fixed_pairs(
+            keys, attentions, pair_manifest, prime, 16, future_horizon,
+            quantization_scales, use_permuted=False
+        )
 
-        # Show head-specific patterns
-        valid_heads = [r for r in per_head_S2 if not np.isnan(r)]
-        if valid_heads:
-            print(f"  Per-head S_2: mean={np.mean(valid_heads):.4f}, "
-                  f"std={np.std(valid_heads):.4f}, "
-                  f"range=[{np.min(valid_heads):.4f}, {np.max(valid_heads):.4f}]")
+        rho_S2_p, _ = spearmanr(stats_p['S2'], att)
+        print(f"  rho_S2 (p={prime}): {rho_S2_p:.4f}")
 
-        results[f'real_p{prime}'] = {
-            'euclidean_corr_p': euc_corr_p,
-            'cosine_corr_p': cos_corr_p,
-            'padic_min_corr_s': min_corr_s,
-            'padic_mean_corr_s': mean_corr_s,
-            'padic_S1_corr_s': S1_corr_s,
-            'padic_S2_corr_s': S2_corr_s,
-            'padic_S3_corr_s': S3_corr_s,
-            'padic_S4_corr_s': S4_corr_s,
-            'S2_ci': (S2_ci_lower, S2_ci_upper),
-            'cosine_ci': (cos_ci_lower, cos_ci_upper),
-            'diff_S2_cosine': diff,
-            'diff_ci_approx': (diff_ci_lower, diff_ci_upper),
-            'per_head_S2': per_head_S2,
+        results[f'p{prime}_prec16'] = {
+            'rho_S2': rho_S2_p,
         }
 
     # Test multiple precisions (p=2 only)
     print(f"\n--- Multiple Precisions (p=2) ---")
-    for precision in [8, 12, 16]:
-        stats = run_single_analysis(keys, attentions, num_pairs, 2, precision, None, use_gpu)
-        S2_arr = np.array(stats['padic_S2'])
-        att_arr = np.array(stats['attention'])
-        S2_corr_s, _ = spearmanr(S2_arr, att_arr)
-        print(f"{precision}-bit: S_2 r_s={S2_corr_s:.4f}")
-        results[f'real_prec{precision}'] = {'padic_S2_corr_s': S2_corr_s}
+    for precision in [8, 12]:
+        stats_prec = compute_all_statistics_fixed_pairs(
+            keys, attentions, pair_manifest, 2, precision, future_horizon,
+            quantization_scales, use_permuted=False
+        )
+        rho_S2_prec, _ = spearmanr(stats_prec['S2'], att)
+        print(f"  {precision}-bit: rho_S2={rho_S2_prec:.4f}")
 
-    # Run analysis for RANDOM baseline
-    print(f"\n{'='*80}")
-    print("RANDOM BASELINE (control for FP16 artifact)")
-    print(f"{'='*80}")
-
-    for prime in [2, 3, 5]:
-        print(f"\n--- Prime p={prime} ---")
-        stats = run_single_analysis(random_keys, attentions, num_pairs, prime, 16, None, use_gpu)
-
-        euc_arr = np.array(stats['euclidean'])
-        cos_arr = np.array(stats['cosine'])
-        att_arr = np.array(stats['attention'])
-        S2_arr = np.array(stats['padic_S2'])
-
-        euc_corr_p, _ = pearsonr(-euc_arr, att_arr)
-        cos_corr_p, _ = pearsonr(cos_arr, att_arr)
-        S2_corr_s, _ = spearmanr(S2_arr, att_arr)
-
-        print(f"Overall: Euclidean r_p={euc_corr_p:.4f}, Cosine r_p={cos_corr_p:.4f}, S_2 r_s={S2_corr_s:.4f}")
-
-        results[f'random_p{prime}'] = {
-            'euclidean_corr_p': euc_corr_p,
-            'cosine_corr_p': cos_corr_p,
-            'padic_S2_corr_s': S2_corr_s,
+        results[f'p2_prec{precision}'] = {
+            'rho_S2': rho_S2_prec,
         }
-
-    # Final verdict
-    print(f"\n{'='*80}")
-    print("VERDICT")
-    print(f"{'='*80}")
-
-    # Use S_2 as the primary statistic (robust in high dimensions)
-    real_p2_S2 = results['real_p2']['padic_S2_corr_s']
-    real_p2_cos = results['real_p2']['cosine_corr_p']
-    real_p2_diff = results['real_p2']['diff_S2_cosine']
-    real_p2_diff_ci = results['real_p2']['diff_ci_approx']
-
-    rand_p2 = results['random_p2']['padic_S2_corr_s']
-    real_p3 = results['real_p3']['padic_S2_corr_s']
-    real_p5 = results['real_p5']['padic_S2_corr_s']
-
-    print(f"\nUsing S_2 (Spearman) vs Cosine (Pearson):")
-    print(f"Real transformer (p=2):")
-    print(f"  S_2:    {real_p2_S2:.4f}")
-    print(f"  Cosine: {real_p2_cos:.4f}")
-    print(f"  Diff:   {real_p2_diff:.4f}, 95% CI ≈ [{real_p2_diff_ci[0]:.4f}, {real_p2_diff_ci[1]:.4f}]")
-    print(f"Random baseline (p=2): S_2={rand_p2:.4f}")
-    print(f"Real transformer (p=3): S_2={real_p3:.4f}")
-    print(f"Real transformer (p=5): S_2={real_p5:.4f}")
-
-    # Interpret results based on CIs and multi-prime consistency
-    print(f"\n{'='*80}")
-    print("INTERPRETATION")
-    print('='*80)
-    print("\nNOTE: CIs use naive bootstrap (not sequence-level resampling).")
-    print("True uncertainty likely larger due to pair dependencies.\n")
-
-    # Check if CI excludes zero (statistically significant difference)
-    ci_excludes_zero = (real_p2_diff_ci[0] > 0) or (real_p2_diff_ci[1] < 0)
-
-    # Check if real >> random
-    real_stronger_than_random = real_p2_S2 > rand_p2 + 0.05  # At least 0.05 better
-
-    # Check multi-prime consistency
-    multi_prime_consistent = (real_p3 > 0.3) and (real_p5 > 0.3)
-
-    if ci_excludes_zero and real_p2_diff > 0.1 and real_stronger_than_random and multi_prime_consistent:
-        print("✅ STRONG P-ADIC SIGNAL")
-        print(f"   - S_2 significantly better than Cosine (CI excludes 0)")
-        print(f"   - Real >> random baseline (+{real_p2_S2 - rand_p2:.3f})")
-        print(f"   - Signal across multiple primes (not just FP16)")
-        print("   → Proceed with PadicKV implementation")
-    elif ci_excludes_zero and real_p2_diff > 0:
-        print("⚠️  MODERATE P-ADIC SIGNAL")
-        print(f"   - S_2 statistically better than Cosine, but small effect")
-        print(f"   - May be partially FP16 artifact (check p=3, p=5)")
-        print("   → Investigate further before implementation")
-    elif real_stronger_than_random:
-        print("⚠️  WEAK SIGNAL - Likely FP16 artifact")
-        print(f"   - S_2 no better than Cosine (CI includes 0)")
-        print(f"   - Real > random but not by much")
-        print("   → Probably detecting binary encoding, not structure")
-    else:
-        print("❌ NO P-ADIC ADVANTAGE")
-        print(f"   - S_2 ≈ Cosine ≈ Random")
-        print(f"   - No evidence of ultrametric structure")
-        print("   → Abandon p-adic KV compression")
 
     return results
 
@@ -733,8 +603,8 @@ def main():
     parser.add_argument("--max-length", type=int, default=512, help="Max sequence length")
     parser.add_argument("--layer", type=int, default=6, help="Layer to analyze")
     parser.add_argument("--num-pairs", type=int, default=500, help="Number of pairs to sample for correlation")
-    parser.add_argument("--use-gpu", action="store_true", default=True, help="Use GPU-accelerated distance computation")
-    parser.add_argument("--use-cpu", action="store_true", help="Force CPU-only computation")
+    parser.add_argument("--future-horizon", type=int, default=64, help="Number of future queries for attention similarity")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for pair manifest")
     parser.add_argument("--output", type=str, required=True, help="Output JSON file")
     parser.add_argument("--cache-dir", type=str, default="/workspace/padic-transformers/checkpoints/pretrained")
 
@@ -771,12 +641,14 @@ def main():
     print("  - Probing KEY structure only (not VALUES)")
     print("  - Values extracted but not analyzed")
     print("  - Separate V probe needed for complete picture")
-    print("\nFeatures:")
-    print("  ✓ Per-head analysis (no averaging across subspaces)")
-    print("  ✓ Robust S_k statistics (not degenerate min in 256-D)")
-    print("  ✓ Attention columns (key behavior, not query behavior)")
+    print("\nFixes applied:")
+    print("  ✓ Fixed quantization scale per layer/head")
+    print("  ✓ Spearman for all, bootstrap delta directly")
+    print("  ✓ Same pair manifest everywhere")
+    print("  ✓ Fixed future-attention horizon")
+    print("  ✓ Token-permutation null control")
     print("\nControls:")
-    print("  ✓ Random baseline (same distribution)")
+    print("  ✓ Permutation null (token shuffling)")
     print("  ✓ Multiple primes (p=2, 3, 5)")
     print("  ✓ Multiple precisions (8, 12, 16 bit)")
     print("="*80)
@@ -818,9 +690,6 @@ def main():
     print(f"\nExtracting KV states from {len(texts)} samples...")
     kv_states = extract_kv_states(model, tokenizer, texts, max_length=args.max_length)
 
-    # Determine GPU usage
-    use_gpu = args.use_gpu and not args.use_cpu
-
     # Analyze K structure (values probed separately)
     print(f"\n{'='*80}")
     print("PROBING KEY (K) STRUCTURE ONLY")
@@ -831,7 +700,8 @@ def main():
         kv_states,
         layer_idx=args.layer,
         num_pairs=args.num_pairs,
-        use_gpu=use_gpu
+        future_horizon=args.future_horizon,
+        seed=args.seed,
     )
 
     # Save results
