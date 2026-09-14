@@ -167,14 +167,14 @@ eval-math:
 # Experiment 1: P-adic structure probe
 probe-smoke:
 	@echo "Running smoke test for p-adic probe..."
-	$(DOCKER_RUN) python scripts/smoke_test_probe.py
+	$(DOCKER_RUN) python3 scripts/smoke_test_probe.py
 
 probe-exp1:
 	@echo "Running Experiment 1: P-adic structure probe on WikiText"
 	@echo "  Model: pythia-1b, Layer: 6"
 	@echo "  Samples: 2000, Pairs per head: 1000, Bootstrap: 1000"
 	@mkdir -p results
-	$(DOCKER_RUN) python scripts/probe_kv_structure.py \
+	$(DOCKER_RUN) python3 scripts/probe_kv_structure.py \
 		--num-samples 2000 \
 		--num-pairs 1000 \
 		--n-bootstrap 1000 \
@@ -183,7 +183,7 @@ probe-exp1:
 probe-quick:
 	@echo "Running quick probe test (200 samples, 100 pairs)..."
 	@mkdir -p results
-	$(DOCKER_RUN) python scripts/probe_kv_structure.py \
+	$(DOCKER_RUN) python3 scripts/probe_kv_structure.py \
 		--num-samples 200 \
 		--num-pairs 100 \
 		--n-bootstrap 100 \
