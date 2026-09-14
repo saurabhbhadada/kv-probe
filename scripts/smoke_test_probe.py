@@ -21,7 +21,7 @@ sys.path.insert(0, project_root)
 
 import torch
 import numpy as np
-from src.kernels import _2adic_valuation
+from src.kernels.padic_ops import _2adic_valuation
 
 def test_2adic_valuation():
     """Test that _2adic_valuation is correct."""

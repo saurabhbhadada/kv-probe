@@ -30,9 +30,13 @@ TODO: Create probe_V_structure.py to analyze value similarity vs output similari
 import argparse
 import json
 import sys
+import os
 from pathlib import Path
 
-sys.path.insert(0, '/workspace/padic-transformers')
+# Add project root to path (works both locally and in Docker)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+sys.path.insert(0, project_root)
 
 import torch
 import numpy as np
@@ -41,7 +45,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from scipy.stats import spearmanr
 
-from src.kernels import _padic_valuation
+from src.kernels.padic_ops import _padic_valuation
 
 
 def extract_kv_states(model, tokenizer, texts, max_length=512):
