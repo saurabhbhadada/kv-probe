@@ -170,24 +170,37 @@ probe-smoke:
 	$(DOCKER_RUN) python3 scripts/smoke_test_probe.py
 
 probe-exp1:
-	@echo "Running Experiment 1: P-adic structure probe on WikiText"
-	@echo "  Model: pythia-1b, Layer: 6"
-	@echo "  Samples: 2000, Pairs per head: 1000, Bootstrap: 1000"
-	@mkdir -p results
+	@if [ -z "$(LAYER)" ]; then \
+		LAYER=6; \
+	else \
+		LAYER=$(LAYER); \
+	fi; \
+	echo "Running Experiment 1: P-adic structure probe on WikiText"; \
+	echo "  Model: pythia-1b, Layer: $$LAYER"; \
+	echo "  Samples: 2000, Pairs per head: 1000, Bootstrap: 1000"; \
+	mkdir -p results; \
 	$(DOCKER_RUN) python3 scripts/probe_kv_structure.py \
+		--layer $$LAYER \
 		--num-samples 2000 \
 		--num-pairs 1000 \
 		--n-bootstrap 1000 \
-		--output results/probe_wikitext_layer6_1M.json
+		--output results/probe_wikitext_layer$${LAYER}_1M.json
 
 probe-quick:
-	@echo "Running quick probe test (200 samples, 100 pairs)..."
-	@mkdir -p results
+	@if [ -z "$(LAYER)" ]; then \
+		LAYER=6; \
+	else \
+		LAYER=$(LAYER); \
+	fi; \
+	echo "Running quick probe test (200 samples, 100 pairs)..."; \
+	echo "  Layer: $$LAYER"; \
+	mkdir -p results; \
 	$(DOCKER_RUN) python3 scripts/probe_kv_structure.py \
+		--layer $$LAYER \
 		--num-samples 200 \
 		--num-pairs 100 \
 		--n-bootstrap 100 \
-		--output results/probe_quick.json
+		--output results/probe_quick_layer$${LAYER}.json
 
 # Leaderboard submission
 submit-openllm:
