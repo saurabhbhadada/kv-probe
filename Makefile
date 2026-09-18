@@ -1,14 +1,14 @@
 .PHONY: help build up down shell jupyter tensorboard train eval test download clean logs probe-smoke probe-exp1 probe-quick
 
 # Project configuration
-PROJECT_NAME := padic-transformers
+PROJECT_NAME := kv-probe
 DOCKER_COMPOSE := docker-compose
-DOCKER_RUN := $(DOCKER_COMPOSE) run --rm padic-dev
+DOCKER_RUN := $(DOCKER_COMPOSE) run --rm kv-probe-dev
 
 # Default target
 help:
-	@echo "P-adic Transformers - Make Commands"
-	@echo "===================================="
+	@echo "KV-Probe - Make Commands"
+	@echo "========================"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup          - Initial setup (create dirs, env file)"

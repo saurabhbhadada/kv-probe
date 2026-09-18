@@ -33,7 +33,7 @@ This guide walks you through running Experiment 1: Probing for ultrametric struc
 
 ```bash
 # From your local machine (SSH'd into GPU server)
-cd /path/to/padic-transformers
+cd /path/to/kv-probe
 
 # Run regression test inside Docker container
 make exec CMD="python3 test_2adic_valuation.py"
@@ -64,7 +64,7 @@ Test layer 6 on WikiText with 1M tokens:
 
 ```bash
 # From your local machine (SSH'd into GPU server)
-cd /path/to/padic-transformers
+cd /path/to/kv-probe
 
 # Run inside Docker container
 CUDA_VISIBLE_DEVICES=5 make exec CMD="python3 scripts/probe_kv_structure.py \

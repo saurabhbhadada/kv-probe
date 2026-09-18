@@ -1,12 +1,12 @@
 version: '3.8'
 
 services:
-  padic-dev:
+  kv-probe-dev:
     build:
       context: .
       dockerfile: Dockerfile
-    image: padic-transformers:latest
-    container_name: padic-transformers-dev
+    image: kv-probe:latest
+    container_name: kv-probe-dev
 
     # GPU configuration - only GPUs 5 and 6
     deploy:
@@ -19,10 +19,10 @@ services:
 
     # Mount project directory
     volumes:
-      - .:/workspace/padic-transformers
-      - ./datasets:/workspace/padic-transformers/datasets
-      - ./checkpoints:/workspace/padic-transformers/checkpoints
-      - ./results:/workspace/padic-transformers/results
+      - .:/workspace/kv-probe
+      - ./datasets:/workspace/kv-probe/datasets
+      - ./checkpoints:/workspace/kv-probe/checkpoints
+      - ./results:/workspace/kv-probe/results
 
     # Expose ports
     ports:
@@ -35,7 +35,7 @@ services:
     environment:
       - WANDB_API_KEY=${WANDB_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
-      - PYTHONPATH=/workspace/padic-transformers/src
+      - PYTHONPATH=/workspace/kv-probe/src
 
     # Keep container running
     stdin_open: true

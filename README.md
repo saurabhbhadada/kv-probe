@@ -1,8 +1,17 @@
-# P-adic Transformers
+# KV-Probe
 
-Research project exploring 2-adic number representations in transformer architectures for improved memory efficiency and hierarchical reasoning.
+Research project for probing transformer KV cache structure using different distance geometries.
 
-**Target**: 1B parameter hybrid model | **Timeline**: 3-4 months to publication
+**Goal**: Determine which geometric distance metrics best predict attention patterns in transformer key-value caches.
+
+## Overview
+
+This project systematically probes transformer KV caches to understand their geometric structure by testing correlation between different distance metrics and attention behavior.
+
+**Currently Implemented:**
+- P-adic (p=2, 3, 5) - Ultrametric distance based on prime factorization
+- Euclidean (L2) - Standard distance metric baseline
+- Cosine similarity - Angular distance baseline
 
 ## Quick Start
 
@@ -10,87 +19,79 @@ Research project exploring 2-adic number representations in transformer architec
 
 ```bash
 # On your remote GPU machine:
-git clone <repo> padic-transformers && cd padic-transformers
+git clone <repo> kv-probe && cd kv-probe
 make build              # Build Docker (10-15 mins, one-time)
-make download-pythia    # Download Pythia-1B (~2GB)
 
-# Run first experiment (baseline)
-CUDA_VISIBLE_DEVICES=0 make exec CMD="python scripts/run_baseline.py --output results/baseline.json"
+# Run quick validation test
+CUDA_VISIBLE_DEVICES=0 make exec CMD="python scripts/smoke_test_probe.py"
 
-# Run with compression
-CUDA_VISIBLE_DEVICES=0 make exec CMD="python scripts/run_compression.py --compression simple_2x --output results/compression_2x.json"
+# Run full probe experiment
+CUDA_VISIBLE_DEVICES=0 make exec CMD="python scripts/probe_kv_structure.py \
+    --model pythia-1b \
+    --dataset wikitext \
+    --num-samples 2000 \
+    --layer 6 \
+    --num-pairs 1000 \
+    --output results/probe_layer6.json"
 
-# Visualize results
-make jupyter  # Open notebooks/01_visualize_compression_results.ipynb
+# Analyze results
+python scripts/summarize_probe_results.py results/probe_*.json
 ```
 
-## Results
+## Research Questions
 
-**Experiment 0:** ✅ **Baseline INT8 Quantization** (Not yet true p-adic compression)
+1. **Do transformer KV caches exhibit exploitable geometric structure?**
+   - Does any distance metric predict attention patterns better than random?
 
-**Setup:** Pythia-1B, WikiText-103, 2048 tokens context, 8-bit precision
+2. **Which geometry best captures KV structure?**
+   - Comparing different distance metrics systematically
 
-**Note:** This implements standard dynamic-range INT8 quantization as a baseline. The core research question—whether transformer KV caches exhibit exploitable p-adic/ultrametric structure—is addressed in Experiment 1 (planned).
+3. **Is structure layer-specific or model-specific?**
+   - Does it vary across layers (early vs middle vs late)?
+   - Does it vary across models (Pythia vs Llama vs Qwen)?
 
-| Metric | Baseline | Compressed (8-bit) | Improvement |
-|--------|----------|-------------------|-------------|
-| **Perplexity** | 13.48 | 13.55 | 0.5% degradation ✅ |
-| **Cache Memory** | 256 MB* | 128 MB | **2.0x compression** 🎯 |
-| **Peak Memory** | 1520 MB | 1408 MB | 7.4% reduction |
-| **Inference Speed** | 2.86s | 2.83s |  |
+4. **Is structure domain-specific?**
+   - Code vs natural language vs mathematics
 
-*Baseline cache is theoretical (element count × float16 size); compressed is measured
+## Current Results
 
-**Key Findings:**
-- **Quality preservation**: <1% perplexity increase with 8-bit 2-adic quantization
-- **2x memory reduction**: KV cache compressed from float16 → uint8
-- **Speed bonus**: Faster inference from reduced memory bandwidth
-- **Scalable**: Savings increase linearly with context length
+**Experiment Status:** 🔄 In Progress
+
+Initial p-adic (p=2) experiments showed query-induced correlation **lower** than Euclidean distance. Now expanding to test additional geometries systematically.
 
 📊 **[Full experimental details](docs/EXPERIMENTS.md)** - Hypothesis, methodology, analysis
 
 ## Documentation
 
 📚 **Core Documentation**
-- **[Experimental Plan](docs/EXPERIMENTAL_PLAN.md)** - Complete research roadmap, both tracks, timeline ⭐ START HERE
-- **[Experimental Log](docs/EXPERIMENTS.md)** - Hypothesis, results, and analysis for all experiments 📊
-- **[P-adic Probe Guide](docs/PROBE_GUIDE.md)** - Step-by-step instructions for Experiment 1 🔬
-- [Project Overview & Architecture](docs/PROJECT.md) - Full project details, datasets, benchmarks
-- [Leaderboard Submission Guide](docs/LEADERBOARDS.md) - Publication strategy, evaluation methodology
-
-🔧 **Development**
-- [Makefile Commands](Makefile) - All available commands
-- [Docker Setup](Dockerfile) - Environment configuration
+- **[Experimental Log](docs/EXPERIMENTS.md)** - Hypothesis, results, and analysis 📊
+- **[Probe Guide](docs/PROBE_GUIDE.md)** - Step-by-step instructions for running probes 🔬
+- **[Quick Start](docs/QUICKSTART.md)** - Environment setup
 
 ## Project Structure
 
 ```
-padic-transformers/
-├── src/                # Source code
-│   ├── models/         # P-adic + hybrid architectures
-│   ├── kernels/        # Custom Triton/CUDA kernels
-│   ├── data/           # Data loading & preprocessing
-│   ├── training/       # Training loops
-│   └── evaluation/     # Benchmark evaluation
-├── datasets/           # Downloaded datasets
-├── configs/            # Experiment configs
-├── scripts/            # Training/eval scripts
-└── docs/               # Documentation
+kv-probe/
+├── src/
+│   └── geometries/         # Distance metric implementations
+│       └── padic.py        # P-adic ultrametric distance
+├── scripts/
+│   ├── probe_kv_structure.py      # Main probe experiment
+│   ├── smoke_test_probe.py        # Quick validation
+│   ├── summarize_probe_results.py # Result analysis
+│   └── download_model.py          # Download models
+├── tests/
+│   └── test_padic_ops.py          # Geometry tests
+└── docs/                           # Documentation
 ```
 
 ## Key Features
 
-- **2-adic embeddings** - Binary-aligned for hardware efficiency
-- **Memory compression** - KV-cache compression for long context
-- **Hybrid architecture** - Mix of 2-adic and standard transformer layers
-- **Custom kernels** - Optimized Triton/CUDA implementations
-
-## Research Goals
-
-1. Match baseline 1B models on standard benchmarks
-2. Achieve 2-4x memory compression with <5% accuracy drop
-3. Excel at hierarchical reasoning (math, code)
-4. Publish at ICLR/NeurIPS/ICML
+- **Multi-geometry probing** - Test different distance metrics
+- **Per-head analysis** - Analyze each attention head independently
+- **Statistical rigor** - Bootstrap confidence intervals, Spearman correlation
+- **Null controls** - Permutation tests, random baselines
+- **Extensible** - Easy to add new geometries
 
 ## License
 

@@ -3,9 +3,9 @@
 import pytest
 import torch
 import sys
-sys.path.insert(0, '/workspace/padic-transformers/src')
+sys.path.insert(0, '/workspace/kv-probe/src')
 
-from kernels.padic_ops import (
+from geometries.padic import (
     float_to_2adic,
     _2adic_to_float,
     float_to_2adic_signed,

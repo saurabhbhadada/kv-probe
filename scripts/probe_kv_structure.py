@@ -45,7 +45,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from scipy.stats import spearmanr
 
-from src.kernels.padic_ops import _padic_valuation
+from src.geometries.padic import _padic_valuation
 
 
 def extract_kv_states(model, tokenizer, texts, max_length=512):

@@ -1,4 +1,4 @@
-# P-adic Transformers Development Environment
+# KV-Probe Development Environment
 # Using CUDA 12.1 (compatible with driver 580.x / CUDA 13.0)
 FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
 
@@ -82,7 +82,7 @@ RUN pip3 install \
     mypy
 
 # Set working directory
-WORKDIR /workspace/padic-transformers
+WORKDIR /workspace/kv-probe
 
 # Expose ports for Jupyter and TensorBoard
 EXPOSE 8888 6006

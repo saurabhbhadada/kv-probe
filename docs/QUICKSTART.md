@@ -11,14 +11,14 @@ Get your first p-adic compression experiment running in 1 hour.
 ```bash
 # From your local machine
 cd /Users/saurabhbhadada/Desktop/current/research
-rsync -avz --exclude '.git' padic-transformers/ user@your-gpu-server:~/padic-transformers/
+rsync -avz --exclude '.git' kv-probe/ user@your-gpu-server:~/kv-probe/
 ```
 
 ### Option B: Using git (recommended)
 
 ```bash
 # On local machine
-cd padic-transformers
+cd kv-probe
 git init
 git add .
 git commit -m "Initial p-adic transformers setup"
@@ -27,8 +27,8 @@ git push -u origin main
 
 # On remote machine
 ssh user@your-gpu-server
-git clone <your-repo-url> padic-transformers
-cd padic-transformers
+git clone <your-repo-url> kv-probe
+cd kv-probe
 ```
 
 ---
@@ -38,7 +38,7 @@ cd padic-transformers
 ```bash
 # SSH into GPU machine
 ssh user@your-gpu-server
-cd ~/padic-transformers
+cd ~/kv-probe
 
 # Setup directories and config
 make setup
@@ -267,7 +267,7 @@ make gpu-info  # Test
 ```bash
 # Run from within container
 make shell
-cd /workspace/padic-transformers
+cd /workspace/kv-probe
 python scripts/run_baseline.py ...
 ```
 
@@ -276,7 +276,7 @@ python scripts/run_baseline.py ...
 ## File Locations
 
 ```
-padic-transformers/
+kv-probe/
 ├── checkpoints/pretrained/  # Downloaded models
 ├── results/                 # Experiment outputs (JSON, plots)
 ├── notebooks/               # Jupyter analysis notebooks

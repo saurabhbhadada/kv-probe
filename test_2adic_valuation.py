@@ -9,7 +9,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, script_dir)
 
 import torch
-from src.kernels.padic_ops import _2adic_valuation
+from src.geometries.padic import _2adic_valuation
 
 def test_2adic_valuation():
     """Test that _2adic_valuation computes correctly for each element independently."""
