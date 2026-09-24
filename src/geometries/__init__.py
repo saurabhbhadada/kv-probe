@@ -19,6 +19,7 @@ from .padic import (
     visualize_2adic,
     Float2Adic,
     float_to_2adic_differentiable,
+    UltrametricMetric,
 )
 
 # Base class
@@ -71,6 +72,7 @@ __all__ = [
     'visualize_2adic',
     'Float2Adic',
     'float_to_2adic_differentiable',
+    'UltrametricMetric',
     # Base class
     'GeometryMetric',
     # Baseline geometries

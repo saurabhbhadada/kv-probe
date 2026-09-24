@@ -328,3 +328,114 @@ class Float2Adic(torch.autograd.Function):
 def float_to_2adic_differentiable(x: torch.Tensor, precision: int = 8) -> torch.Tensor:
     """Differentiable version of float_to_2adic for use in training."""
     return Float2Adic.apply(x, precision)
+
+
+# Geometry metric wrapper
+
+from typing import Dict, Any, Optional
+from .base import GeometryMetric
+
+
+class UltrametricMetric(GeometryMetric):
+    """
+    P-adic ultrametric distance metric for keys.
+
+    Quantizes keys to p-adic representation and computes ultrametric distance.
+    Uses robust S_k statistics (fraction of dimensions with v_p >= k) instead
+    of degenerate min(v_p) in high dimensions.
+
+    Config:
+        prime: Prime for p-adic (default: 2)
+        precision: Bit precision (default: 16)
+        k_threshold: Valuation threshold for S_k statistic (default: 4)
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.prime = self.config.get('prime', 2)
+        self.precision = self.config.get('precision', 16)
+        self.k_threshold = self.config.get('k_threshold', 4)
+        self.name = f"ultrametric_p{self.prime}"
+
+    def precompute(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        queries: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Precompute quantized keys.
+
+        Args:
+            keys: [seq_len, d_model]
+            values: [seq_len, d_model]
+            queries: (unused)
+
+        Returns:
+            dict with 'keys_quantized' and 'scale'
+        """
+        # Quantize keys to p-adic representation
+        keys_quantized, scale = float_to_2adic(keys, precision=self.precision)
+
+        return {
+            'keys_quantized': keys_quantized,
+            'scale': scale,
+        }
+
+    def compute_pairwise(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        pairs: torch.Tensor,
+        queries: Optional[torch.Tensor] = None,
+        keys_quantized: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Compute p-adic ultrametric distance for pairs.
+
+        Uses S_k statistic: fraction of dimensions with v_p(k_i - k_j) >= k.
+
+        Args:
+            keys: [seq_len, d_model]
+            values: [seq_len, d_model]
+            pairs: [num_pairs, 2]
+            queries: (unused)
+            keys_quantized: Precomputed quantized keys
+            scale: Quantization scale
+
+        Returns:
+            distances: [num_pairs]
+        """
+        if keys_quantized is None:
+            # Quantize on the fly if not precomputed
+            keys_quantized, scale = float_to_2adic(keys, precision=self.precision)
+
+        num_pairs = pairs.shape[0]
+        device = keys.device
+        d_model = keys.shape[1]
+
+        # Extract indices
+        i_indices = pairs[:, 0]  # [num_pairs]
+        j_indices = pairs[:, 1]  # [num_pairs]
+
+        # Get quantized key pairs
+        ki_quant = keys_quantized[i_indices]  # [num_pairs, d_model]
+        kj_quant = keys_quantized[j_indices]  # [num_pairs, d_model]
+
+        # Compute differences
+        diff = ki_quant.to(torch.int32) - kj_quant.to(torch.int32)  # [num_pairs, d_model]
+
+        # Compute p-adic valuations
+        valuations = _padic_valuation(diff, prime=self.prime, precision=self.precision)  # [num_pairs, d_model]
+
+        # Compute S_k statistic: fraction of dimensions with v_p >= k
+        s_k = (valuations >= self.k_threshold).to(torch.float32).mean(dim=1)  # [num_pairs]
+
+        # Convert to distance: higher S_k = more similar = smaller distance
+        # Use (1 - S_k) as distance
+        distances = 1.0 - s_k
+
+        return distances.to(device)

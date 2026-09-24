@@ -126,24 +126,25 @@ class QueryMahalanobisMetric(GeometryMetric):
             distances = norms / (T ** 0.5)
 
         else:  # causal mode
-            # For each pair (i, j), only use queries from positions after max(i, j)
-            # This is slower but more realistic
+            # For each pair (i, j), only use queries from BEFORE max(i, j)
+            # This represents what we know about the query distribution from past context
 
             for idx in range(num_pairs):
                 i_pos = i_indices[idx].item()
                 j_pos = j_indices[idx].item()
                 max_pos = max(i_pos, j_pos)
 
-                # Get causal queries: positions after max_pos, within window
-                future_start = max_pos + 1
-                future_end = min(seq_len, future_start + self.causal_window)
+                # Get causal queries: positions BEFORE max_pos (past context)
+                # Use a window of recent past queries
+                causal_start = max(0, max_pos - self.causal_window)
+                causal_end = max_pos  # Exclusive: only queries before this position
 
-                if future_end <= future_start:
-                    # No future queries available
+                if causal_end <= causal_start:
+                    # No past queries available
                     distances[idx] = 0.0
                     continue
 
-                Q_causal = query_matrix[future_start:future_end]  # [T_causal, d_model]
+                Q_causal = query_matrix[causal_start:causal_end]  # [T_causal, d_model]
                 T_causal = Q_causal.shape[0]
 
                 if T_causal == 0:

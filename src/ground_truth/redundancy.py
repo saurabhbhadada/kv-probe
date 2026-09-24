@@ -48,6 +48,17 @@ def compute_deletion_damage(
 
     # Compute attention: [num_queries, seq_len]
     logits = queries @ keys.T / temperature  # [num_queries, seq_len]
+
+    # Apply causal mask: query at position t can only attend to keys at positions <= t
+    # Since queries may not align with key positions, we use a conservative approach:
+    # Each query can attend to all keys (no causal restriction for deletion damage)
+    # However, if queries are from the same sequence, we should apply causal mask
+    # For now, we assume queries are future queries and can attend to all keys
+    # This is correct when called from benchmark with Q_future
+
+    # Note: The benchmark now passes Q_future which are already valid future queries,
+    # so we don't need additional causal masking here
+
     attentions = F.softmax(logits, dim=1)  # [num_queries, seq_len]
 
     # Compute original output: o = sum_i a_i v_i
@@ -102,7 +113,7 @@ def compute_merge_damage(
         keys: [seq_len, d_model]
         values: [seq_len, d_model]
         queries: [num_queries, d_model]
-        pairs: [num_pairs, 2] - pairs to merge
+        pairs: [num_pairs, 2] - pairs to merge (will be canonicalized to i < j)
         temperature: Temperature for attention
         merge_strategy: How to merge ('average' or 'weighted')
 
@@ -119,14 +130,21 @@ def compute_merge_damage(
 
     # Compute original attention and output
     logits = queries @ keys.T / temperature  # [num_queries, seq_len]
+
+    # No additional causal masking needed here since we're using future queries
+    # passed from the benchmark
     attentions = F.softmax(logits, dim=1)  # [num_queries, seq_len]
     output_original = attentions @ values  # [num_queries, d_model]
 
     damage = torch.zeros(num_queries, num_pairs, device=device)
 
     for pair_idx in range(num_pairs):
-        i_pos = pairs[pair_idx, 0].item()
-        j_pos = pairs[pair_idx, 1].item()
+        i_pos_raw = pairs[pair_idx, 0].item()
+        j_pos_raw = pairs[pair_idx, 1].item()
+
+        # Canonicalize pair: ensure i < j
+        i_pos = min(i_pos_raw, j_pos_raw)
+        j_pos = max(i_pos_raw, j_pos_raw)
 
         # Get keys and values
         ki = keys[i_pos]  # [d_model]
@@ -141,6 +159,7 @@ def compute_merge_damage(
 
             # Create merged keys/values
             # Replace position i with merged, remove position j
+            # This reduces sequence length by exactly 1
             keys_merged = torch.cat([
                 keys[:i_pos],
                 k_merged.unsqueeze(0),
@@ -154,6 +173,10 @@ def compute_merge_damage(
                 values[i_pos+1:j_pos],
                 values[j_pos+1:],
             ], dim=0)  # [seq_len - 1, d_model]
+
+            # Verify we reduced length by exactly 1
+            assert keys_merged.shape[0] == seq_len - 1, \
+                f"Merge failed: expected {seq_len-1}, got {keys_merged.shape[0]}"
 
         else:
             raise ValueError(f"Unknown merge_strategy: {merge_strategy}")

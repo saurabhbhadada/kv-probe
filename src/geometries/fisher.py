@@ -7,24 +7,33 @@ For a query q:
     J = diag(a) - a a^T  (Jacobian of softmax)
 
 The Fisher metric measures how much the attention distribution changes
-when perturbing keys.
+when perturbing keys, using the Fisher information metric / second-order KL approximation.
 
 Perturbation definition:
-We consider replacing key k_i with k_j (or vice versa), which changes
-the logit z_i to z_j. The first-order change in attention is:
+We consider swapping key k_i with k_j, which changes logit z_i to z_j.
+The first-order change in attention is:
     delta_a ≈ J * e_i * (z_j - z_i)
 
 where e_i is the i-th unit vector.
 
-The Fisher distance is:
-    d_F^2(i,j) = mean_q [||J * e_i * (z_j - z_i)||^2]
+The Fisher distance (single-position swap) is the squared Fisher norm:
+    d_F^2(i,j) = mean_q [(delta_z)^T J (delta_z)]
 
-Mathematical simplification:
-    ||J * e_i * (z_j - z_i)||^2
-    = (z_j - z_i)^2 * ||J * e_i||^2
-    = (z_j - z_i)^2 * a_i * (1 - a_i)
+For a single-position swap (z_i -> z_j), this simplifies to:
+    delta_a = J * e_i * (z_j - z_i)
+    ||delta_a||^2 = (delta_z)^T e_i^T J^T J e_i (delta_z)
 
-This avoids constructing the full Jacobian matrix.
+Since J is symmetric for softmax, J^T = J, and:
+    e_i^T J^T J e_i = (J e_i)^T (J e_i) = ||J e_i||^2 = a_i(1 - a_i)
+
+Therefore:
+    d_F^2(i,j) = mean_q [(z_j - z_i)^2 * a_i * (1 - a_i)]
+
+This is a quadratic form in delta_z that measures the second-order KL divergence
+between attention distributions, not simply ||J delta_z||^2.
+
+Note: For two-position merges, the full Fisher metric would include cross-terms
+from J_ij, but the current implementation treats swap and merge separately.
 """
 
 import torch
