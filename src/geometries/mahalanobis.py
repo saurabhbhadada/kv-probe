@@ -33,8 +33,9 @@ class QueryMahalanobisMetric(GeometryMetric):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
         self.mode = self.config.get('mode', 'oracle')  # 'oracle' or 'causal'
-        self.causal_window = self.config.get('causal_window', 128)  # for causal mode
+        self.causal_window = self.config.get('causal_window', 128)  # for causal mode (used by runner)
         self.reg_epsilon = self.config.get('reg_epsilon', 1e-6)  # regularization
+        self.queries_prewindowed = self.config.get('queries_prewindowed', False)  # if True, don't window again
         self.name = f"mahalanobis_{self.mode}"
 
     def precompute(
@@ -129,33 +130,52 @@ class QueryMahalanobisMetric(GeometryMetric):
             # For each pair (i, j), only use queries from BEFORE max(i, j)
             # This represents what we know about the query distribution from past context
 
-            for idx in range(num_pairs):
-                i_pos = i_indices[idx].item()
-                j_pos = j_indices[idx].item()
-                max_pos = max(i_pos, j_pos)
+            # CRITICAL: If queries are already windowed by the runner (queries_prewindowed=True),
+            # use them directly without further slicing. The runner has already sliced
+            # Q[max(0, t-window):t] for the pair at position t.
 
-                # Get causal queries: positions BEFORE max_pos (past context)
-                # Use a window of recent past queries
-                causal_start = max(0, max_pos - self.causal_window)
-                causal_end = max_pos  # Exclusive: only queries before this position
-
-                if causal_end <= causal_start:
-                    # No past queries available
-                    distances[idx] = 0.0
-                    continue
-
-                Q_causal = query_matrix[causal_start:causal_end]  # [T_causal, d_model]
+            if self.queries_prewindowed:
+                # Queries are already windowed - use them as-is for all pairs
+                Q_causal = query_matrix  # [T_causal, d_model]
                 T_causal = Q_causal.shape[0]
 
                 if T_causal == 0:
-                    distances[idx] = 0.0
-                    continue
+                    # No queries available
+                    distances[:] = 0.0
+                else:
+                    # Compute ||Q delta_k||_2 / sqrt(T) for all pairs
+                    Q_delta = Q_causal @ delta_k.T  # [T_causal, num_pairs]
+                    norms = torch.norm(Q_delta, p=2, dim=0)  # [num_pairs]
+                    distances = norms / (T_causal ** 0.5)
+            else:
+                # Legacy path: queries have original token positions, need to window per-pair
+                for idx in range(num_pairs):
+                    i_pos = i_indices[idx].item()
+                    j_pos = j_indices[idx].item()
+                    max_pos = max(i_pos, j_pos)
 
-                # ||Q delta_k||_2 / sqrt(T)
-                delta_k_single = delta_k[idx]  # [d_model]
-                Q_delta_single = Q_causal @ delta_k_single  # [T_causal]
-                norm = torch.norm(Q_delta_single, p=2)
-                distances[idx] = norm / (T_causal ** 0.5)
+                    # Get causal queries: positions BEFORE max_pos (past context)
+                    # Use a window of recent past queries
+                    causal_start = max(0, max_pos - self.causal_window)
+                    causal_end = max_pos  # Exclusive: only queries before this position
+
+                    if causal_end <= causal_start:
+                        # No past queries available
+                        distances[idx] = 0.0
+                        continue
+
+                    Q_causal = query_matrix[causal_start:causal_end]  # [T_causal, d_model]
+                    T_causal = Q_causal.shape[0]
+
+                    if T_causal == 0:
+                        distances[idx] = 0.0
+                        continue
+
+                    # ||Q delta_k||_2 / sqrt(T)
+                    delta_k_single = delta_k[idx]  # [d_model]
+                    Q_delta_single = Q_causal @ delta_k_single  # [T_causal]
+                    norm = torch.norm(Q_delta_single, p=2)
+                    distances[idx] = norm / (T_causal ** 0.5)
 
         return distances
 
@@ -170,9 +190,15 @@ class QueryMahalanobisOracleMetric(QueryMahalanobisMetric):
 
 
 class QueryMahalanobisCausalMetric(QueryMahalanobisMetric):
-    """Causal variant: uses only past queries."""
+    """Causal variant: uses only past queries.
+
+    Assumes queries are pre-windowed by the runner to avoid double-windowing.
+    """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         config = config or {}
         config['mode'] = 'causal'
+        # Default: assume runner already windowed the queries
+        if 'queries_prewindowed' not in config:
+            config['queries_prewindowed'] = True
         super().__init__(config)

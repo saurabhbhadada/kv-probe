@@ -151,11 +151,11 @@ def extract_kv_and_queries(model, tokenizer, texts, max_length=512):
                     "Add support for this architecture or use a supported model."
                 )
 
-            # Move to CPU to save GPU memory
-            all_keys.append([k.cpu() for k in layer_keys])
-            all_values.append([v.cpu() for v in layer_values])
-            all_queries.append([q.cpu() for q in layer_queries])
-            all_attention.append([a.cpu() for a in layer_attentions])
+            # Keep on GPU for now - will move to CPU per-sample during benchmarking
+            all_keys.append(layer_keys)
+            all_values.append(layer_values)
+            all_queries.append(layer_queries)
+            all_attention.append(layer_attentions)
 
     return {
         'keys': all_keys,
@@ -332,10 +332,12 @@ def run_benchmark_single_head(
     head_idx, layer_idx, dataset_name, sample_id,
     num_pairs=500, future_horizon=64, min_future_queries=32,
     pair_strategy='random', seed=42,
-    sanity_check=True, keep_on_gpu=True
+    sanity_check=True
 ):
     """
     Run benchmark for a single (layer, head, sample).
+
+    Processes one sample at a time on CPU to save memory.
 
     Args:
         min_future_queries: Minimum number of future queries required to evaluate a pair.
@@ -346,16 +348,13 @@ def run_benchmark_single_head(
         DataFrame with one row per pair, columns for all metrics + ground truth
     """
     # keys: [batch=1, heads, seq, dim]
+    # Move to CPU for processing (one sample at a time is more memory-efficient)
+    keys = keys.cpu()
+    values = values.cpu()
+    queries = queries.cpu()
+    attentions = attentions.cpu()
+
     # Extract for this head
-    original_device = keys.device
-
-    # Keep on GPU if requested
-    if not keep_on_gpu:
-        keys = keys.cpu()
-        values = values.cpu()
-        queries = queries.cpu()
-        attentions = attentions.cpu()
-
     K = keys[0, head_idx, :, :]  # [seq, dim]
     V = values[0, head_idx, :, :]  # [seq, dim]
     Q = queries[0, head_idx, :, :]  # [seq, dim]
@@ -464,8 +463,11 @@ def run_benchmark_single_head(
                     future_end = min(future_start + future_horizon, seq_len)
                     if future_start < seq_len:
                         Q_window = Q[future_start:future_end, :]
+                        # Extract attention weights for future queries
+                        A_window = A[future_start:future_end, :]  # [num_future, seq_len]
                     else:
                         Q_window = torch.empty(0, d_model, device=device)
+                        A_window = None
                 elif query_mode == 'causal':
                     # Causal: use past queries Q[max(0, t-window):t]
                     window_size = getattr(geom, 'causal_window', 128)
@@ -473,17 +475,21 @@ def run_benchmark_single_head(
                     past_end = t
                     if past_end > past_start:
                         Q_window = Q[past_start:past_end, :]
+                        # Extract attention weights for past queries
+                        A_window = A[past_start:past_end, :]  # [num_past, seq_len]
                     else:
                         Q_window = torch.empty(0, d_model, device=device)
+                        A_window = None
                 else:
                     Q_window = Q  # Fallback (shouldn't happen)
+                    A_window = A
 
                 # Compute distance for this single pair
                 if Q_window.shape[0] > 0:
                     pair_single = torch.tensor([[i_pos, j_pos]], dtype=torch.long, device=device)
                     precomputed = geom.precompute(K, V, queries=Q_window)
                     distance = geom.compute_pairwise(
-                        K, V, pair_single, queries=Q_window, **precomputed
+                        K, V, pair_single, queries=Q_window, attentions=A_window, **precomputed
                     )
                     distances_list.append(distance[0].item())
                 else:

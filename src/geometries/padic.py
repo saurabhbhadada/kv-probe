@@ -336,13 +336,20 @@ from typing import Dict, Any, Optional
 from .base import GeometryMetric
 
 
-class UltrametricMetric(GeometryMetric):
+class PadicSimilarityMetric(GeometryMetric):
     """
-    P-adic ultrametric distance metric for keys.
+    P-adic S_k similarity statistic for keys.
 
-    Quantizes keys to p-adic representation and computes ultrametric distance.
-    Uses robust S_k statistics (fraction of dimensions with v_p >= k) instead
-    of degenerate min(v_p) in high dimensions.
+    Quantizes keys to p-adic representation and computes the S_k statistic:
+    fraction of dimensions where v_p(k_i - k_j) >= k.
+
+    Returns (1 - S_k) as a distance-like quantity where:
+    - 0 means all dimensions have high p-adic valuation (very similar)
+    - 1 means no dimensions have high p-adic valuation (very different)
+
+    IMPORTANT: This is NOT a true ultrametric distance. It does not satisfy
+    the ultrametric inequality d(x,z) <= max(d(x,y), d(y,z)). It is a
+    heuristic similarity statistic based on p-adic valuations.
 
     Config:
         prime: Prime for p-adic (default: 2)
@@ -355,7 +362,7 @@ class UltrametricMetric(GeometryMetric):
         self.prime = self.config.get('prime', 2)
         self.precision = self.config.get('precision', 16)
         self.k_threshold = self.config.get('k_threshold', 4)
-        self.name = f"ultrametric_p{self.prime}"
+        self.name = f"padic_sk_p{self.prime}_k{self.k_threshold}"
 
     def precompute(
         self,
@@ -439,3 +446,7 @@ class UltrametricMetric(GeometryMetric):
         distances = 1.0 - s_k
 
         return distances.to(device)
+
+
+# Backward compatibility alias
+UltrametricMetric = PadicSimilarityMetric

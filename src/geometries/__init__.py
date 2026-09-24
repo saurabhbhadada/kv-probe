@@ -19,8 +19,11 @@ from .padic import (
     visualize_2adic,
     Float2Adic,
     float_to_2adic_differentiable,
-    UltrametricMetric,
+    PadicSimilarityMetric,
 )
+
+# Backward compatibility alias
+UltrametricMetric = PadicSimilarityMetric
 
 # Base class
 from .base import GeometryMetric
@@ -72,7 +75,8 @@ __all__ = [
     'visualize_2adic',
     'Float2Adic',
     'float_to_2adic_differentiable',
-    'UltrametricMetric',
+    'PadicSimilarityMetric',
+    'UltrametricMetric',  # Backward compatibility alias
     # Base class
     'GeometryMetric',
     # Baseline geometries

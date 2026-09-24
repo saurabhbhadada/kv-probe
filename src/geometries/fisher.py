@@ -183,16 +183,21 @@ class FisherSymmetricMetric(GeometryMetric):
         values: torch.Tensor,
         pairs: torch.Tensor,
         queries: Optional[torch.Tensor] = None,
+        attentions: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
         Compute symmetric Fisher distance.
+
+        Prefers using real model attention weights for sensitivity if provided.
+        Falls back to recomputing if not available.
 
         Args:
             keys: [seq_len, d_model]
             values: [seq_len, d_model]
             pairs: [num_pairs, 2]
             queries: [num_queries, d_model]
+            attentions: [num_queries, seq_len] - optional real attention weights
 
         Returns:
             distances: [num_pairs]
@@ -208,9 +213,27 @@ class FisherSymmetricMetric(GeometryMetric):
         # Compute temperature
         temperature = self.temperature if self.temperature > 0 else math.sqrt(d_model)
 
-        # Compute all logits
+        # Compute logits
         logits_all = queries @ keys.T / temperature  # [num_queries, seq_len]
-        attentions = F.softmax(logits_all, dim=1)  # [num_queries, seq_len]
+
+        # Use provided attentions if available (preferred), otherwise recompute
+        if attentions is not None:
+            # Use real model attention weights
+            # IMPORTANT: If queries are from future positions, these attentions
+            # already have causal masking applied correctly
+            attentions_use = attentions  # [num_queries, seq_len]
+        else:
+            # Fallback: recompute with explicit causal masking
+            # WARNING: This assumes causal attention, which may not be correct
+            # for all model types. Prefer passing real attentions.
+            if num_queries < seq_len:
+                # Queries are a subset (e.g., future queries) - no causal mask needed
+                attentions_use = F.softmax(logits_all, dim=1)  # [num_queries, seq_len]
+            else:
+                # Full sequence - apply causal mask
+                causal_mask = torch.triu(torch.ones(num_queries, seq_len, device=device), diagonal=1).bool()
+                logits_masked = logits_all.masked_fill(causal_mask, float('-inf'))
+                attentions_use = F.softmax(logits_masked, dim=1)  # [num_queries, seq_len]
 
         # Extract indices
         i_indices = pairs[:, 0]
@@ -219,8 +242,8 @@ class FisherSymmetricMetric(GeometryMetric):
         # Get logits and attentions
         logits_i = logits_all[:, i_indices]  # [num_queries, num_pairs]
         logits_j = logits_all[:, j_indices]  # [num_queries, num_pairs]
-        a_i = attentions[:, i_indices]  # [num_queries, num_pairs]
-        a_j = attentions[:, j_indices]  # [num_queries, num_pairs]
+        a_i = attentions_use[:, i_indices]  # [num_queries, num_pairs]
+        a_j = attentions_use[:, j_indices]  # [num_queries, num_pairs]
 
         # Symmetric Fisher
         logit_diff = logits_j - logits_i  # [num_queries, num_pairs]
