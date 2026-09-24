@@ -16,6 +16,13 @@ class GeometryMetric(ABC):
 
     Each metric computes how "different" or "redundant" two keys/values are
     according to some geometric notion.
+
+    Attributes:
+        higher_is_more_similar: If True, higher metric values indicate MORE similar keys
+                               (e.g., cosine similarity, where 1.0 = identical).
+                               If False, higher values indicate LESS similar keys
+                               (e.g., Euclidean distance, where 0 = identical).
+                               This is critical for correct AUROC/AUPRC computation.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -27,6 +34,9 @@ class GeometryMetric(ABC):
         """
         self.config = config or {}
         self.name = self.__class__.__name__.replace('Metric', '').lower()
+        # Default: assume metric is a distance (higher = less similar)
+        # Subclasses should override this if they are similarity metrics
+        self.higher_is_more_similar = False
 
     @abstractmethod
     def compute_pairwise(

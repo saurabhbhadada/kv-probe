@@ -122,6 +122,8 @@ class CosineSimilarityMetric(GeometryMetric):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(config)
         self.name = "cosine_similarity"
+        # Override default: this is a similarity metric (higher = more similar)
+        self.higher_is_more_similar = True
 
     def compute_pairwise(
         self,

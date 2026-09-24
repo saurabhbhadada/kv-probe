@@ -37,7 +37,7 @@ RUN pip3 install triton
 
 # Install core ML libraries
 RUN pip3 install \
-    transformers \
+    transformers==5.17.0 \
     accelerate \
     deepspeed \
     bitsandbytes \

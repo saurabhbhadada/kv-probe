@@ -17,6 +17,7 @@ def compute_deletion_damage(
     queries: torch.Tensor,
     positions: torch.Tensor,
     temperature: Optional[float] = None,
+    query_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute damage from deleting individual tokens.
@@ -35,6 +36,8 @@ def compute_deletion_damage(
         queries: [num_queries, d_model]
         positions: [num_positions] - positions to compute damage for
         temperature: Temperature for attention (default: sqrt(d_model))
+        query_positions: [num_queries] - absolute position of each query in sequence
+                         Used for causal masking: query at position q attends only to keys <= q
 
     Returns:
         damage: [num_queries, num_positions] - deletion damage per query
@@ -49,15 +52,15 @@ def compute_deletion_damage(
     # Compute attention: [num_queries, seq_len]
     logits = queries @ keys.T / temperature  # [num_queries, seq_len]
 
-    # Apply causal mask: query at position t can only attend to keys at positions <= t
-    # Since queries may not align with key positions, we use a conservative approach:
-    # Each query can attend to all keys (no causal restriction for deletion damage)
-    # However, if queries are from the same sequence, we should apply causal mask
-    # For now, we assume queries are future queries and can attend to all keys
-    # This is correct when called from benchmark with Q_future
-
-    # Note: The benchmark now passes Q_future which are already valid future queries,
-    # so we don't need additional causal masking here
+    # Apply causal mask if query_positions provided
+    if query_positions is not None:
+        # query_positions: [num_queries], values are absolute positions in sequence
+        # Create causal mask: query at position q can only attend to keys at positions <= q
+        # mask[q, k] = True if key position k > query position q (should be masked)
+        query_pos_expanded = query_positions.unsqueeze(1)  # [num_queries, 1]
+        key_positions = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        causal_mask = key_positions > query_pos_expanded  # [num_queries, seq_len]
+        logits = logits.masked_fill(causal_mask, float('-inf'))
 
     attentions = F.softmax(logits, dim=1)  # [num_queries, seq_len]
 
@@ -99,6 +102,7 @@ def compute_merge_damage(
     pairs: torch.Tensor,
     temperature: Optional[float] = None,
     merge_strategy: str = 'average',
+    query_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute damage from merging pairs of tokens.
@@ -116,6 +120,8 @@ def compute_merge_damage(
         pairs: [num_pairs, 2] - pairs to merge (will be canonicalized to i < j)
         temperature: Temperature for attention
         merge_strategy: How to merge ('average' or 'weighted')
+        query_positions: [num_queries] - absolute position of each query in sequence
+                         Used for causal masking: query at position q attends only to keys <= q
 
     Returns:
         damage: [num_queries, num_pairs] - merge damage per query
@@ -131,8 +137,13 @@ def compute_merge_damage(
     # Compute original attention and output
     logits = queries @ keys.T / temperature  # [num_queries, seq_len]
 
-    # No additional causal masking needed here since we're using future queries
-    # passed from the benchmark
+    # Apply causal mask if query_positions provided
+    if query_positions is not None:
+        query_pos_expanded = query_positions.unsqueeze(1)  # [num_queries, 1]
+        key_positions = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        causal_mask = key_positions > query_pos_expanded  # [num_queries, seq_len]
+        logits = logits.masked_fill(causal_mask, float('-inf'))
+
     attentions = F.softmax(logits, dim=1)  # [num_queries, seq_len]
     output_original = attentions @ values  # [num_queries, d_model]
 
@@ -183,6 +194,29 @@ def compute_merge_damage(
 
         # Recompute attention with merged cache
         logits_merged = queries @ keys_merged.T / temperature  # [num_queries, seq_len-1]
+
+        # Apply causal mask to merged logits if query_positions provided
+        if query_positions is not None:
+            # After merging i and j (i < j), the new key positions are:
+            # - Positions 0 to i-1: unchanged
+            # - Position i: merged (originally positions i and j)
+            # - Positions i+1 to j-1: unchanged
+            # - Positions j onwards: shifted left by 1 (originally j+1 onwards)
+
+            # Create mapping of merged key positions to original positions
+            merged_key_positions = torch.cat([
+                torch.arange(i_pos, device=device),  # 0 to i-1
+                torch.tensor([i_pos], device=device),  # merged key at position i
+                torch.arange(i_pos + 1, j_pos, device=device),  # i+1 to j-1
+                torch.arange(j_pos + 1, seq_len, device=device),  # j+1 onwards (original positions)
+            ])  # [seq_len - 1]
+
+            # Apply causal mask: query at position q attends only to keys with original position <= q
+            query_pos_expanded = query_positions.unsqueeze(1)  # [num_queries, 1]
+            merged_key_pos_expanded = merged_key_positions.unsqueeze(0)  # [1, seq_len-1]
+            causal_mask_merged = merged_key_pos_expanded > query_pos_expanded  # [num_queries, seq_len-1]
+            logits_merged = logits_merged.masked_fill(causal_mask_merged, float('-inf'))
+
         attentions_merged = F.softmax(logits_merged, dim=1)  # [num_queries, seq_len-1]
         output_merged = attentions_merged @ values_merged  # [num_queries, d_model]
 

@@ -20,6 +20,10 @@ import sys
 import os
 from pathlib import Path
 
+# Module-level storage for geometry metadata
+# Maps geometry name -> higher_is_more_similar (bool)
+GEOMETRY_METADATA = {}
+
 # Add project root to path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
@@ -84,46 +88,8 @@ def extract_kv_and_queries(model, tokenizer, texts, max_length=512):
 
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            # Storage for hooked Q tensors (post-RoPE)
-            queries_cache = []
-
-            def make_query_hook(layer_idx):
-                """Create hook to capture Q tensor after RoPE but before attention."""
-                def hook_fn(module, args, kwargs, output):
-                    # Hook into attention forward_hook to capture Q after RoPE
-                    # For different architectures, we'll reconstruct Q from the inputs
-                    # This is a forward_pre_hook alternative - we use forward with context
-                    pass
-                return hook_fn
-
-            # Register hooks to capture queries
-            handles = []
-            for layer_idx, layer in enumerate(model.gpt_neox.layers if hasattr(model, 'gpt_neox') else
-                                              model.transformer.h if hasattr(model, 'transformer') else
-                                              model.model.layers):
-                def capture_queries(layer_idx):
-                    """Closure to capture queries for specific layer."""
-                    queries_list = []
-
-                    def hook(module, input, output):
-                        # The hook captures intermediate Q values
-                        # We'll extract them from module's intermediate computation
-                        queries_list.append(None)  # Placeholder
-
-                    queries_cache.append(queries_list)
-                    return hook
-
-                # Register hook on attention module
-                attn_module = layer.attention if hasattr(layer, 'attention') else layer.attn
-                handle = attn_module.register_forward_hook(capture_queries(layer_idx))
-                handles.append(handle)
-
             # Forward pass to get KV cache and attention
             outputs = model(**inputs, output_attentions=True, use_cache=True, output_hidden_states=True)
-
-            # Remove hooks
-            for handle in handles:
-                handle.remove()
 
             past_kv = outputs.past_key_values
             if past_kv is None or len(past_kv) == 0:
@@ -134,46 +100,56 @@ def extract_kv_and_queries(model, tokenizer, texts, max_length=512):
             layer_values = [kv[1] for kv in past_kv]
             layer_attentions = [attn for attn in outputs.attentions]
 
-            # Reconstruct queries from attention patterns and keys
-            # Q @ K^T / sqrt(d) = logits, so Q = logits * sqrt(d) @ K^{-1}
-            # However, K is not square, so we use a different approach:
-            # We recompute Q from hidden states using the model's projection matrices
-
+            # Reconstruct queries from hidden states using correct layer norm + RoPE
+            # Following exact GPT-NeoX/Pythia implementation (transformers 5.17.0)
             hidden_states = outputs.hidden_states
             layer_queries = []
 
             # Determine model architecture
             if hasattr(model, 'gpt_neox'):
-                # Pythia / GPTNeoX
+                # Pythia / GPTNeoX (transformers 5.17.0+)
                 layers = model.gpt_neox.layers
-                for layer_idx, layer in enumerate(layers):
-                    h = hidden_states[layer_idx]
-                    attn = layer.attention
+                num_heads = model.config.num_attention_heads
 
-                    # Apply query projection
-                    qkv = attn.query_key_value(h)
+                # Import the actual apply_rotary_pos_emb from transformers
+                from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
+
+                for layer_idx, layer in enumerate(layers):
+                    # CRITICAL: Use layer-normalized hidden state
+                    # This is what actually enters the attention module
+                    h_raw = hidden_states[layer_idx]  # [batch, seq, hidden]
+                    h = layer.input_layernorm(h_raw)  # Layer norm before attention
+
+                    attn = layer.attention
+                    head_size = attn.head_size
+
+                    # Project to QKV
+                    qkv = attn.query_key_value(h)  # [batch, seq, 3 * hidden]
                     batch_size, seq_len = h.shape[:2]
 
-                    # Reshape and split
-                    new_shape = (batch_size, seq_len, attn.num_attention_heads, 3 * attn.head_size)
-                    qkv = qkv.view(*new_shape)
-                    qkv = qkv.permute(0, 2, 1, 3)  # [batch, heads, seq, 3*head_size]
+                    # Reshape: [batch, seq, num_heads, 3 * head_size]
+                    qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_size)
+                    # Transpose: [batch, num_heads, seq, 3 * head_size]
+                    qkv = qkv.transpose(1, 2)
 
-                    q, k, v = torch.split(qkv, attn.head_size, dim=-1)
+                    # Split into Q, K, V
+                    q, k, v = qkv.chunk(3, dim=-1)  # Each: [batch, num_heads, seq, head_size]
 
-                    # Apply RoPE to get post-RoPE Q (matching cached K)
-                    if hasattr(attn, 'rotary_emb') and attn.rotary_emb is not None:
-                        # Get cos/sin for RoPE
-                        seq_len_kv = q.shape[2]
-                        cos, sin = attn.rotary_emb(v, seq_len=seq_len_kv)
-                        # Apply rotary position embeddings
-                        q, k = attn._apply_rotary_pos_emb(q, k, cos, sin, position_ids=None)
+                    # Apply RoPE using model-level rotary embeddings
+                    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+                    cos, sin = model.gpt_neox.rotary_emb(h, position_ids=position_ids)
+
+                    # Apply rotary position embeddings (exact HF implementation)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
                     layer_queries.append(q)
             else:
-                # Fallback: use keys as queries (same as before, but with warning)
-                print("Warning: Unknown model architecture, using keys as proxy for queries")
-                layer_queries = layer_keys
+                # Unsupported architecture - fail immediately
+                raise ValueError(
+                    f"Unsupported model architecture: {model.__class__.__name__}. "
+                    "Only GPT-NeoX/Pythia models are currently supported. "
+                    "Add support for this architecture or use a supported model."
+                )
 
             # Move to CPU to save GPU memory
             all_keys.append([k.cpu() for k in layer_keys])
@@ -189,9 +165,15 @@ def extract_kv_and_queries(model, tokenizer, texts, max_length=512):
     }
 
 
-def sanity_check_qk_reconstruction(queries, keys, attention_weights, head_idx, layer_idx, temperature=None):
+def sanity_check_qk_reconstruction(queries, keys, attention_weights, head_idx, layer_idx,
+                                   scaling_factor, tolerance=0.01):
     """
-    Sanity check: verify that softmax(Q @ K^T / sqrt(d) + causal_mask) ≈ attention_weights.
+    Sanity check: verify that softmax(Q @ K^T * scaling + causal_mask) ≈ attention_weights.
+
+    For GPT-NeoX: scaling = 1 / sqrt(head_dim)
+
+    This check MUST pass - if reconstruction fails, the Q extraction is incorrect and
+    the benchmark results would be invalid. Fails hard on tolerance violation.
 
     Args:
         queries: [batch, heads, seq, dim]
@@ -199,24 +181,25 @@ def sanity_check_qk_reconstruction(queries, keys, attention_weights, head_idx, l
         attention_weights: [batch, heads, seq, seq]
         head_idx: which head to check
         layer_idx: which layer to check
-        temperature: attention temperature (default: sqrt(dim))
+        scaling_factor: attention scaling (1/sqrt(head_dim) for GPT-NeoX)
+        tolerance: maximum allowed error (default: 0.01)
 
     Returns:
         max_error: maximum absolute difference
         mean_error: mean absolute difference
+
+    Raises:
+        RuntimeError: if max_error > tolerance
     """
     Q = queries[0, head_idx, :, :]  # [seq, dim]
     K = keys[0, head_idx, :, :]  # [seq, dim]
     A_true = attention_weights[0, head_idx, :, :]  # [seq, seq]
 
-    seq_len, d_model = Q.shape
+    seq_len, head_dim = Q.shape
     device = Q.device
 
-    if temperature is None:
-        temperature = torch.sqrt(torch.tensor(d_model, dtype=Q.dtype))
-
-    # Compute Q @ K^T / temperature
-    logits = Q @ K.T / temperature  # [seq, seq]
+    # Compute Q @ K^T * scaling
+    logits = (Q @ K.T) * scaling_factor  # [seq, seq]
 
     # Apply causal mask
     causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
@@ -226,19 +209,31 @@ def sanity_check_qk_reconstruction(queries, keys, attention_weights, head_idx, l
     A_recon = torch.nn.functional.softmax(logits, dim=-1)  # [seq, seq]
 
     # Compute errors
-    # Ignore positions with -inf in original (they should be 0 in both)
+    # Ignore positions with -inf or NaN
     valid_mask = ~torch.isnan(A_true) & ~torch.isinf(A_true)
 
     errors = torch.abs(A_recon - A_true)
     max_error = errors[valid_mask].max().item() if valid_mask.sum() > 0 else 0.0
     mean_error = errors[valid_mask].mean().item() if valid_mask.sum() > 0 else 0.0
 
-    if max_error > 0.01:
-        print(f"WARNING: QK reconstruction check failed for layer={layer_idx}, head={head_idx}")
-        print(f"  Max error: {max_error:.6f}, Mean error: {mean_error:.6f}")
-        print(f"  This suggests Q or K tensors may not be correctly extracted/aligned")
-    else:
-        print(f"✓ QK reconstruction verified: layer={layer_idx}, head={head_idx}, max_err={max_error:.6f}")
+    if max_error > tolerance:
+        error_msg = (
+            f"FATAL: QK reconstruction check failed for layer={layer_idx}, head={head_idx}\n"
+            f"  Max error: {max_error:.6f} (tolerance: {tolerance})\n"
+            f"  Mean error: {mean_error:.6f}\n"
+            f"  Q shape: {Q.shape}, K shape: {K.shape}\n"
+            f"  Scaling factor: {scaling_factor:.6f}\n"
+            f"  This indicates Q or K tensors are not correctly extracted.\n"
+            f"  Possible causes:\n"
+            f"    - Wrong layer normalization (must use layer.input_layernorm)\n"
+            f"    - Incorrect RoPE application\n"
+            f"    - Mismatched coordinate systems between Q and K\n"
+            f"  Benchmark results would be invalid - aborting."
+        )
+        raise RuntimeError(error_msg)
+
+    print(f"✓ QK reconstruction verified: layer={layer_idx}, head={head_idx}, "
+          f"max_err={max_error:.6f}, mean_err={mean_error:.6f}")
 
     return max_error, mean_error
 
@@ -335,11 +330,17 @@ def sample_pairs(seq_len, num_pairs, strategy='random', seed=42, unique=True):
 def run_benchmark_single_head(
     keys, values, queries, attentions,
     head_idx, layer_idx, dataset_name, sample_id,
-    num_pairs=500, future_horizon=64, pair_strategy='random', seed=42,
+    num_pairs=500, future_horizon=64, min_future_queries=32,
+    pair_strategy='random', seed=42,
     sanity_check=True, keep_on_gpu=True
 ):
     """
     Run benchmark for a single (layer, head, sample).
+
+    Args:
+        min_future_queries: Minimum number of future queries required to evaluate a pair.
+                           Pairs near sequence end without sufficient future context are skipped.
+                           Default: 32 (ensures stable ground truth estimates)
 
     Returns:
         DataFrame with one row per pair, columns for all metrics + ground truth
@@ -362,12 +363,16 @@ def run_benchmark_single_head(
 
     seq_len, d_model = K.shape
     device = K.device
-    head_dim = d_model  # for attention temperature
+    head_dim = d_model
 
     # Sanity check: verify Q @ K^T reconstruction
-    if sanity_check and sample_id == 0:  # Only check first sample to avoid spam
+    # CRITICAL: This MUST pass for valid Q extraction - fails hard on error
+    if sanity_check and sample_id == 0:  # Only check first sample (one check per head is sufficient)
+        # GPT-NeoX uses scaling = 1 / sqrt(head_dim)
+        scaling_factor = head_dim ** -0.5
         max_err, mean_err = sanity_check_qk_reconstruction(
-            queries, keys, attentions, head_idx, layer_idx, temperature=torch.sqrt(torch.tensor(head_dim, dtype=K.dtype))
+            queries, keys, attentions, head_idx, layer_idx,
+            scaling_factor=scaling_factor, tolerance=0.01
         )
 
     # Sample pairs (unique unordered pairs)
@@ -394,35 +399,35 @@ def run_benchmark_single_head(
     import math
     temp_sqrt_d = math.sqrt(head_dim)
 
-    geometries = [
+    # Non-query geometries: compute on all pairs at once
+    non_query_geometries = [
         EuclideanMetric(),
         CosineDistanceMetric(),
         CosineSimilarityMetric(),
-        QueryMahalanobisOracleMetric(),
-        QueryMahalanobisCausalMetric(),
         SphericalRadialMetric({'lambda_radial': 1.0}),
         SphericalOnlyMetric(),
         RadialOnlyMetric(),
-        ExponentialResponseMetric({'temperature': temp_sqrt_d, 'normalized': True}),
-        FisherSymmetricMetric({'temperature': temp_sqrt_d}),
     ]
 
     # Add p-adic baseline
     try:
         from src.geometries.padic import UltrametricMetric
-        geometries.append(UltrametricMetric({'prime': 2, 'precision': 16}))
+        non_query_geometries.append(UltrametricMetric({'prime': 2, 'precision': 16}))
     except ImportError:
         print("Warning: Could not import p-adic metric")
 
-    # Compute all geometry metrics
-    for geom in geometries:
+    # Compute non-query geometry metrics (don't need queries)
+    for geom in non_query_geometries:
         try:
+            # Store metadata in global dict
+            GEOMETRY_METADATA[geom.name] = geom.higher_is_more_similar
+
             # Precompute if needed
-            precomputed = geom.precompute(K, V, queries=Q)
+            precomputed = geom.precompute(K, V, queries=None)
 
             # Compute pairwise distances
             distances = geom.compute_pairwise(
-                K, V, pairs, queries=Q, **precomputed
+                K, V, pairs, queries=None, **precomputed
             )
 
             results[geom.name] = distances.cpu().numpy().tolist()
@@ -433,8 +438,68 @@ def run_benchmark_single_head(
             print(f"  Traceback: {traceback.format_exc()}")
             results[geom.name] = [np.nan] * num_actual_pairs
 
+    # Query-aware geometries: compute per-pair with appropriate query windows
+    query_aware_geometries = [
+        ('oracle', QueryMahalanobisOracleMetric()),
+        ('oracle', ExponentialResponseMetric({'temperature': temp_sqrt_d, 'normalized': True})),
+        ('oracle', FisherSymmetricMetric({'temperature': temp_sqrt_d})),
+        ('causal', QueryMahalanobisCausalMetric()),
+    ]
+
+    for query_mode, geom in query_aware_geometries:
+        try:
+            # Store metadata in global dict
+            GEOMETRY_METADATA[geom.name] = geom.higher_is_more_similar
+
+            distances_list = []
+
+            for pair_idx in range(num_actual_pairs):
+                i_pos = pairs_np[pair_idx, 0]
+                j_pos = pairs_np[pair_idx, 1]
+                t = max(i_pos, j_pos)
+
+                if query_mode == 'oracle':
+                    # Oracle: use future queries Q[t+1:t+1+future_horizon]
+                    future_start = t + 1
+                    future_end = min(future_start + future_horizon, seq_len)
+                    if future_start < seq_len:
+                        Q_window = Q[future_start:future_end, :]
+                    else:
+                        Q_window = torch.empty(0, d_model, device=device)
+                elif query_mode == 'causal':
+                    # Causal: use past queries Q[max(0, t-window):t]
+                    window_size = getattr(geom, 'causal_window', 128)
+                    past_start = max(0, t - window_size)
+                    past_end = t
+                    if past_end > past_start:
+                        Q_window = Q[past_start:past_end, :]
+                    else:
+                        Q_window = torch.empty(0, d_model, device=device)
+                else:
+                    Q_window = Q  # Fallback (shouldn't happen)
+
+                # Compute distance for this single pair
+                if Q_window.shape[0] > 0:
+                    pair_single = torch.tensor([[i_pos, j_pos]], dtype=torch.long, device=device)
+                    precomputed = geom.precompute(K, V, queries=Q_window)
+                    distance = geom.compute_pairwise(
+                        K, V, pair_single, queries=Q_window, **precomputed
+                    )
+                    distances_list.append(distance[0].item())
+                else:
+                    distances_list.append(np.nan)
+
+            results[geom.name] = distances_list
+        except Exception as e:
+            import traceback
+            print(f"ERROR: {geom.name} ({query_mode}) failed with exception:")
+            print(f"  {e}")
+            print(f"  Traceback: {traceback.format_exc()}")
+            results[geom.name] = [np.nan] * num_actual_pairs
+
     # Compute ground truth: future attention similarity
     # Use only valid future queries: Q[t+1:t+1+future_horizon] where t = max(i,j)
+    # Skip pairs without sufficient future queries
     try:
         future_sims = []
         for pair_idx in range(num_actual_pairs):
@@ -443,8 +508,17 @@ def run_benchmark_single_head(
             t = max(i_pos, j_pos)  # Latest position in the pair
             future_start = t + 1  # First valid future query
 
+            # Check if we have minimum future queries
+            future_end = min(future_start + future_horizon, seq_len)
+            num_future = future_end - future_start
+
+            if num_future < min_future_queries:
+                # Skip: insufficient future context
+                future_sims.append(np.nan)
+                continue
+
             # Only use queries that occur after the pair exists in cache
-            if future_start < seq_len and future_start + future_horizon <= seq_len:
+            if future_start < seq_len and future_end > future_start:
                 # Extract attention columns for future queries only
                 attn_col_i = A[future_start:future_start+future_horizon, i_pos]
                 attn_col_j = A[future_start:future_start+future_horizon, j_pos]
@@ -491,18 +565,39 @@ def run_benchmark_single_head(
             t = max(i_pos, j_pos)
             future_start = t + 1
 
+            # Check minimum future queries
+            future_end = min(future_start + future_horizon, seq_len)
+            num_future = future_end - future_start
+
+            if num_future < min_future_queries:
+                deletion_damage_i.append(np.nan)
+                deletion_damage_j.append(np.nan)
+                continue
+
             # Get valid future queries
             if future_start < seq_len:
-                Q_future = Q[future_start:min(future_start + future_horizon, seq_len), :]
+                future_end = min(future_start + future_horizon, seq_len)
+                Q_future = Q[future_start:future_end, :]
                 if Q_future.shape[0] > 0:
+                    # Compute absolute query positions for causal masking
+                    query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
+
                     # Compute deletion damage for position i
                     pos_i_tensor = torch.tensor([i_pos], dtype=torch.long, device=device)
-                    damage_i = compute_deletion_damage(K, V, Q_future, pos_i_tensor, temperature=temp_sqrt_d)
+                    damage_i = compute_deletion_damage(
+                        K, V, Q_future, pos_i_tensor,
+                        temperature=temp_sqrt_d,
+                        query_positions=query_positions
+                    )
                     deletion_damage_i.append(damage_i.mean().item())
 
                     # Compute deletion damage for position j
                     pos_j_tensor = torch.tensor([j_pos], dtype=torch.long, device=device)
-                    damage_j = compute_deletion_damage(K, V, Q_future, pos_j_tensor, temperature=temp_sqrt_d)
+                    damage_j = compute_deletion_damage(
+                        K, V, Q_future, pos_j_tensor,
+                        temperature=temp_sqrt_d,
+                        query_positions=query_positions
+                    )
                     deletion_damage_j.append(damage_j.mean().item())
                 else:
                     deletion_damage_i.append(np.nan)
@@ -531,13 +626,29 @@ def run_benchmark_single_head(
             t = max(i_pos, j_pos)
             future_start = t + 1
 
+            # Check minimum future queries
+            future_end = min(future_start + future_horizon, seq_len)
+            num_future = future_end - future_start
+
+            if num_future < min_future_queries:
+                merge_damages.append(np.nan)
+                continue
+
             # Get valid future queries
             if future_start < seq_len:
-                Q_future = Q[future_start:min(future_start + future_horizon, seq_len), :]
+                future_end = min(future_start + future_horizon, seq_len)
+                Q_future = Q[future_start:future_end, :]
                 if Q_future.shape[0] > 0:
+                    # Compute absolute query positions for causal masking
+                    query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
+
                     # Compute merge damage for this pair
                     pair_tensor = torch.tensor([[i_pos, j_pos]], dtype=torch.long, device=device)
-                    damage = compute_merge_damage(K, V, Q_future, pair_tensor, temperature=temp_sqrt_d)
+                    damage = compute_merge_damage(
+                        K, V, Q_future, pair_tensor,
+                        temperature=temp_sqrt_d,
+                        query_positions=query_positions
+                    )
                     merge_damages.append(damage.mean().item())
                 else:
                     merge_damages.append(np.nan)
@@ -564,6 +675,8 @@ def main():
     parser.add_argument("--head", type=int, default=None, help="Head to analyze (None = all heads)")
     parser.add_argument("--num-pairs", type=int, default=500, help="Pairs per head")
     parser.add_argument("--future-horizon", type=int, default=64, help="Future queries for attention sim")
+    parser.add_argument("--min-future-queries", type=int, default=32,
+                        help="Minimum future queries required to evaluate a pair (default: 32)")
     parser.add_argument("--pair-strategy", type=str, default="random", choices=["random", "nearby"])
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, required=True, help="Output CSV file")
@@ -628,6 +741,7 @@ def main():
                 head_idx, layer_idx, args.dataset, sample_id,
                 num_pairs=args.num_pairs,
                 future_horizon=args.future_horizon,
+                min_future_queries=args.min_future_queries,
                 pair_strategy=args.pair_strategy,
                 seed=args.seed + sample_id * 100 + head_idx,
             )
@@ -687,21 +801,35 @@ def main():
                 # Threshold ground truth at median to create binary labels
                 if gt == 'future_attention_similarity':
                     # High similarity = safe to merge (positive class)
-                    # Distance should be low for safe merges
                     y_binary = (y > np.median(y)).astype(int)
-                    # Negate distance to get "merge safety" score
-                    scores = -x
                 elif 'damage' in gt:
                     # Low damage = safe to merge (positive class)
                     y_binary = (y < np.median(y)).astype(int)
-                    # Negate damage to get "merge safety" score
-                    scores = -y
+                else:
+                    y_binary = None
 
-                try:
-                    auroc = roc_auc_score(y_binary, scores)
-                    auprc = average_precision_score(y_binary, scores)
-                    print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f} | AUROC: {auroc:.3f} | AUPRC: {auprc:.3f}")
-                except:
+                # Compute predictor scores from geometry metric
+                # Use metadata to determine if we need to negate
+                if y_binary is not None:
+                    # Retrieve geometry metadata from global dict
+                    is_similarity = GEOMETRY_METADATA.get(geom_col, False)
+
+                    if is_similarity:
+                        # Similarity metric: higher = more similar = safer to merge
+                        # Use directly as "merge safety" score
+                        scores = x
+                    else:
+                        # Distance metric: higher = less similar = less safe to merge
+                        # Negate to get "merge safety" score
+                        scores = -x
+
+                    try:
+                        auroc = roc_auc_score(y_binary, scores)
+                        auprc = average_precision_score(y_binary, scores)
+                        print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f} | AUROC: {auroc:.3f} | AUPRC: {auprc:.3f}")
+                    except:
+                        print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
+                else:
                     print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
             except:
                 pass
@@ -725,7 +853,8 @@ def main():
 
             # Find best geometry for this head
             best_geom = None
-            best_spearman = -1.0
+            best_abs_spearman = -np.inf
+            best_spearman = 0.0
 
             for geom_col in geom_cols:
                 mask = ~(group_df[geom_col].isna() | group_df[gt].isna())
@@ -737,7 +866,9 @@ def main():
 
                 try:
                     spearman_r, _ = spearmanr(x, y)
-                    if abs(spearman_r) > abs(best_spearman):
+                    abs_spearman = abs(spearman_r)
+                    if abs_spearman > best_abs_spearman:
+                        best_abs_spearman = abs_spearman
                         best_spearman = spearman_r
                         best_geom = geom_col
                 except:

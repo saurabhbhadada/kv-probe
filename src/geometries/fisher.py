@@ -7,33 +7,28 @@ For a query q:
     J = diag(a) - a a^T  (Jacobian of softmax)
 
 The Fisher metric measures how much the attention distribution changes
-when perturbing keys, using the Fisher information metric / second-order KL approximation.
+when perturbing keys, using the Fisher information metric (second-order KL approximation).
 
-Perturbation definition:
-We consider swapping key k_i with k_j, which changes logit z_i to z_j.
-The first-order change in attention is:
-    delta_a ≈ J * e_i * (z_j - z_i)
+**Mathematical Form:**
 
-where e_i is the i-th unit vector.
+For a single-position swap (changing logit z_i to z_j):
+    delta_z = z_j - z_i
 
-The Fisher distance (single-position swap) is the squared Fisher norm:
-    d_F^2(i,j) = mean_q [(delta_z)^T J (delta_z)]
+The Fisher distance is the quadratic form:
+    d_F^2(i,j) = mean_q [delta_z^T J delta_z]
 
-For a single-position swap (z_i -> z_j), this simplifies to:
-    delta_a = J * e_i * (z_j - z_i)
-    ||delta_a||^2 = (delta_z)^T e_i^T J^T J e_i (delta_z)
+For swapping position i (where delta only affects the i-th logit):
+    delta_z^T J delta_z = (z_j - z_i)^2 * [J]_{ii}
+                        = (z_j - z_i)^2 * a_i * (1 - a_i)
 
-Since J is symmetric for softmax, J^T = J, and:
-    e_i^T J^T J e_i = (J e_i)^T (J e_i) = ||J e_i||^2 = a_i(1 - a_i)
+This measures the second-order KL divergence between attention distributions.
 
-Therefore:
-    d_F^2(i,j) = mean_q [(z_j - z_i)^2 * a_i * (1 - a_i)]
+**Important:** This is NOT ||J delta_z||^2. The Fisher metric is a quadratic form
+delta_z^T J delta_z, which for a single-logit perturbation at position i gives
+the expression above.
 
-This is a quadratic form in delta_z that measures the second-order KL divergence
-between attention distributions, not simply ||J delta_z||^2.
-
-Note: For two-position merges, the full Fisher metric would include cross-terms
-from J_ij, but the current implementation treats swap and merge separately.
+For two-position merges, the full Fisher metric would include cross-terms J_ij,
+but the current implementation treats positions independently.
 """
 
 import torch
