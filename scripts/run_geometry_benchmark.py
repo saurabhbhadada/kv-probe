@@ -59,110 +59,100 @@ from src.ground_truth import (
 )
 
 
-def extract_kv_and_queries(model, tokenizer, texts, max_length=512):
+def extract_single_sample(model, tokenizer, text, max_length=512):
     """
-    Extract KV cache states, attention weights, AND queries from real model inference.
+    Extract KV cache states, attention weights, AND queries from a single text sample.
 
-    Uses hooks to capture actual Q, K, V tensors post-RoPE from attention layers.
+    Uses exact GPT-NeoX/Pythia implementation to reconstruct post-RoPE queries.
 
     Returns:
-        dict with 'keys', 'values', 'queries', 'attention_weights'
+        dict with 'keys', 'values', 'queries', 'attention_weights' (all on GPU)
+        or None if sample is invalid
     """
     model.eval()
     device = next(model.parameters()).device
 
-    all_keys = []
-    all_values = []
-    all_queries = []
-    all_attention = []
+    if not text or not text.strip():
+        return None
 
     with torch.no_grad():
-        for text in tqdm(texts, desc="Extracting KV states and queries"):
-            if not text or not text.strip():
-                continue
+        inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
 
-            inputs = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
+        if inputs['input_ids'].shape[1] == 0:
+            return None
 
-            if inputs['input_ids'].shape[1] == 0:
-                continue
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Forward pass to get KV cache and attention
+        outputs = model(**inputs, output_attentions=True, use_cache=True, output_hidden_states=True)
 
-            # Forward pass to get KV cache and attention
-            outputs = model(**inputs, output_attentions=True, use_cache=True, output_hidden_states=True)
+        past_kv = outputs.past_key_values
+        if past_kv is None or len(past_kv) == 0:
+            return None
 
-            past_kv = outputs.past_key_values
-            if past_kv is None or len(past_kv) == 0:
-                continue
+        # Extract keys, values from past_key_values (these are post-RoPE)
+        layer_keys = [kv[0] for kv in past_kv]
+        layer_values = [kv[1] for kv in past_kv]
+        layer_attentions = [attn for attn in outputs.attentions]
 
-            # Extract keys, values from past_key_values (these are post-RoPE)
-            layer_keys = [kv[0] for kv in past_kv]
-            layer_values = [kv[1] for kv in past_kv]
-            layer_attentions = [attn for attn in outputs.attentions]
+        # Reconstruct queries from hidden states using correct layer norm + RoPE
+        # Following exact GPT-NeoX/Pythia implementation (transformers 5.17.0)
+        hidden_states = outputs.hidden_states
+        layer_queries = []
 
-            # Reconstruct queries from hidden states using correct layer norm + RoPE
-            # Following exact GPT-NeoX/Pythia implementation (transformers 5.17.0)
-            hidden_states = outputs.hidden_states
-            layer_queries = []
+        # Determine model architecture
+        if hasattr(model, 'gpt_neox'):
+            # Pythia / GPTNeoX (transformers 5.17.0+)
+            layers = model.gpt_neox.layers
+            num_heads = model.config.num_attention_heads
 
-            # Determine model architecture
-            if hasattr(model, 'gpt_neox'):
-                # Pythia / GPTNeoX (transformers 5.17.0+)
-                layers = model.gpt_neox.layers
-                num_heads = model.config.num_attention_heads
+            # Import the actual apply_rotary_pos_emb from transformers
+            from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
 
-                # Import the actual apply_rotary_pos_emb from transformers
-                from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
+            for layer_idx, layer in enumerate(layers):
+                # CRITICAL: Use layer-normalized hidden state
+                # This is what actually enters the attention module
+                h_raw = hidden_states[layer_idx]  # [batch, seq, hidden]
+                h = layer.input_layernorm(h_raw)  # Layer norm before attention
 
-                for layer_idx, layer in enumerate(layers):
-                    # CRITICAL: Use layer-normalized hidden state
-                    # This is what actually enters the attention module
-                    h_raw = hidden_states[layer_idx]  # [batch, seq, hidden]
-                    h = layer.input_layernorm(h_raw)  # Layer norm before attention
+                attn = layer.attention
+                head_size = attn.head_size
 
-                    attn = layer.attention
-                    head_size = attn.head_size
+                # Project to QKV
+                qkv = attn.query_key_value(h)  # [batch, seq, 3 * hidden]
+                batch_size, seq_len = h.shape[:2]
 
-                    # Project to QKV
-                    qkv = attn.query_key_value(h)  # [batch, seq, 3 * hidden]
-                    batch_size, seq_len = h.shape[:2]
+                # Reshape: [batch, seq, num_heads, 3 * head_size]
+                qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_size)
+                # Transpose: [batch, num_heads, seq, 3 * head_size]
+                qkv = qkv.transpose(1, 2)
 
-                    # Reshape: [batch, seq, num_heads, 3 * head_size]
-                    qkv = qkv.view(batch_size, seq_len, num_heads, 3 * head_size)
-                    # Transpose: [batch, num_heads, seq, 3 * head_size]
-                    qkv = qkv.transpose(1, 2)
+                # Split into Q, K, V
+                q, k, v = qkv.chunk(3, dim=-1)  # Each: [batch, num_heads, seq, head_size]
 
-                    # Split into Q, K, V
-                    q, k, v = qkv.chunk(3, dim=-1)  # Each: [batch, num_heads, seq, head_size]
+                # Apply RoPE using model-level rotary embeddings
+                position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+                cos, sin = model.gpt_neox.rotary_emb(h, position_ids=position_ids)
 
-                    # Apply RoPE using model-level rotary embeddings
-                    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-                    cos, sin = model.gpt_neox.rotary_emb(h, position_ids=position_ids)
+                # Apply rotary position embeddings (exact HF implementation)
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-                    # Apply rotary position embeddings (exact HF implementation)
-                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                layer_queries.append(q)
+        else:
+            # Unsupported architecture - fail immediately
+            raise ValueError(
+                f"Unsupported model architecture: {model.__class__.__name__}. "
+                "Only GPT-NeoX/Pythia models are currently supported. "
+                "Add support for this architecture or use a supported model."
+            )
 
-                    layer_queries.append(q)
-            else:
-                # Unsupported architecture - fail immediately
-                raise ValueError(
-                    f"Unsupported model architecture: {model.__class__.__name__}. "
-                    "Only GPT-NeoX/Pythia models are currently supported. "
-                    "Add support for this architecture or use a supported model."
-                )
-
-            # Keep on GPU for now - will move to CPU per-sample during benchmarking
-            all_keys.append(layer_keys)
-            all_values.append(layer_values)
-            all_queries.append(layer_queries)
-            all_attention.append(layer_attentions)
-
-    return {
-        'keys': all_keys,
-        'values': all_values,
-        'queries': all_queries,
-        'attention_weights': all_attention,
-    }
+        # Keep tensors on GPU - caller will move to CPU for benchmarking
+        return {
+            'keys': layer_keys,
+            'values': layer_values,
+            'queries': layer_queries,
+            'attention_weights': layer_attentions,
+        }
 
 
 def sanity_check_qk_reconstruction(queries, keys, attention_weights, head_idx, layer_idx,
@@ -721,26 +711,50 @@ def main():
     else:
         raise ValueError(f"Dataset {args.dataset} not yet supported")
 
-    # Extract KV states
-    print(f"\nExtracting KV states...")
-    kv_data = extract_kv_and_queries(model, tokenizer, texts, max_length=args.max_length)
+    print(f"Found {len(texts)} valid text samples")
 
-    # Run benchmark
-    print(f"\nRunning geometry benchmark...")
-    all_results = []
+    # Determine which heads to test (need to extract one sample first to know num_heads)
+    print(f"\nExtracting first sample to determine model structure...")
+    sample_data_first = None
+    for text in texts:
+        sample_data_first = extract_single_sample(model, tokenizer, text, max_length=args.max_length)
+        if sample_data_first is not None:
+            break
+
+    if sample_data_first is None:
+        print("ERROR: No valid samples found")
+        return
 
     layer_idx = args.layer
-    num_heads = kv_data['keys'][0][layer_idx][0].shape[0]
-    heads_to_test = [args.head] if args.head is not None else range(num_heads)
+    num_heads = sample_data_first['keys'][layer_idx].shape[1]  # [batch, heads, seq, dim]
+    heads_to_test = [args.head] if args.head is not None else list(range(num_heads))
 
-    for sample_id, (keys_sample, values_sample, queries_sample, attns_sample) in enumerate(
-        zip(kv_data['keys'], kv_data['values'], kv_data['queries'], kv_data['attention_weights'])
-    ):
-        keys_layer = keys_sample[layer_idx]
-        values_layer = values_sample[layer_idx]
-        queries_layer = queries_sample[layer_idx]
-        attns_layer = attns_sample[layer_idx]
+    print(f"Model has {num_heads} heads per layer")
+    print(f"Testing layer {layer_idx}, heads: {heads_to_test}")
 
+    # Clean up first sample
+    del sample_data_first
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Process samples one at a time
+    print(f"\nProcessing samples and benchmarking...")
+    all_results = []
+
+    for sample_id, text in enumerate(tqdm(texts, desc="Benchmarking samples")):
+        # Extract Q/K/V/attention for this sample
+        sample_data = extract_single_sample(model, tokenizer, text, max_length=args.max_length)
+
+        if sample_data is None:
+            continue
+
+        # Get tensors for requested layer (still on GPU)
+        keys_layer = sample_data['keys'][layer_idx]
+        values_layer = sample_data['values'][layer_idx]
+        queries_layer = sample_data['queries'][layer_idx]
+        attns_layer = sample_data['attention_weights'][layer_idx]
+
+        # Benchmark each requested head
         for head_idx in heads_to_test:
             df = run_benchmark_single_head(
                 keys_layer, values_layer, queries_layer, attns_layer,
@@ -750,10 +764,18 @@ def main():
                 min_future_queries=args.min_future_queries,
                 pair_strategy=args.pair_strategy,
                 seed=args.seed + sample_id * 100 + head_idx,
+                sanity_check=(sample_id == 0),  # Only check first sample
             )
 
             if df is not None:
                 all_results.append(df)
+
+        # Explicitly delete tensors to free memory
+        del sample_data, keys_layer, values_layer, queries_layer, attns_layer
+
+        # Clear GPU cache after each sample
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Combine all results
     if len(all_results) == 0:
