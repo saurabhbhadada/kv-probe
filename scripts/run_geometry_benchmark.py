@@ -697,11 +697,14 @@ def main():
         f"EleutherAI/{args.model}",
         cache_dir=args.cache_dir,
         dtype=torch.float16,
-        device_map="auto",
+        device_map={"": 0},  # Keep on single GPU for Q/RoPE extraction
         attn_implementation="eager",
     )
     tokenizer = AutoTokenizer.from_pretrained(f"EleutherAI/{args.model}", cache_dir=args.cache_dir)
-    print("✓ Model loaded")
+
+    # Verify single-device placement
+    model_device = next(model.parameters()).device
+    print(f"✓ Model loaded on device: {model_device}")
 
     # Load dataset
     print(f"\nLoading dataset: {args.dataset}...")
