@@ -696,7 +696,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         f"EleutherAI/{args.model}",
         cache_dir=args.cache_dir,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map="auto",
         attn_implementation="eager",
     )

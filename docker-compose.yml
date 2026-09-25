@@ -35,7 +35,7 @@ services:
     environment:
       - WANDB_API_KEY=${WANDB_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
-      - PYTHONPATH=/workspace/kv-probe/src
+      - PYTHONPATH=/workspace/kv-probe
 
     # Keep container running
     stdin_open: true
