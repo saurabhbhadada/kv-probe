@@ -100,37 +100,37 @@ test-geometry:
 # Data operations
 download:
 	@echo "Downloading datasets..."
-	$(DOCKER_RUN) python scripts/download_data.py
+	$(DOCKER_RUN) python3 scripts/download_data.py
 
 download-pile:
 	@echo "Downloading The Pile..."
-	$(DOCKER_RUN) python scripts/download_data.py --dataset pile
+	$(DOCKER_RUN) python3 scripts/download_data.py --dataset pile
 
 download-stack:
 	@echo "Downloading The Stack..."
-	$(DOCKER_RUN) python scripts/download_data.py --dataset stack
+	$(DOCKER_RUN) python3 scripts/download_data.py --dataset stack
 
 download-math:
 	@echo "Downloading math datasets..."
-	$(DOCKER_RUN) python scripts/download_data.py --dataset proofpile,openwebmath
+	$(DOCKER_RUN) python3 scripts/download_data.py --dataset proofpile,openwebmath
 
 # Model operations
 download-model:
 	@if [ -z "$(MODEL)" ]; then \
 		echo "Listing available models:"; \
-		$(DOCKER_RUN) python scripts/download_model.py --list; \
+		$(DOCKER_RUN) python3 scripts/download_model.py --list; \
 	else \
 		echo "Downloading model: $(MODEL)"; \
-		$(DOCKER_RUN) python scripts/download_model.py $(MODEL) --test; \
+		$(DOCKER_RUN) python3 scripts/download_model.py $(MODEL) --test; \
 	fi
 
 download-pythia:
 	@echo "Downloading Pythia-1B..."
-	$(DOCKER_RUN) python scripts/download_model.py pythia-1b --test
+	$(DOCKER_RUN) python3 scripts/download_model.py pythia-1b --test
 
 download-tinyllama:
 	@echo "Downloading TinyLlama-1.1B..."
-	$(DOCKER_RUN) python scripts/download_model.py tinyllama --test
+	$(DOCKER_RUN) python3 scripts/download_model.py tinyllama --test
 
 # Training operations
 train:
@@ -139,11 +139,11 @@ train:
 		exit 1; \
 	fi
 	@echo "Training with config: $(CONFIG)"
-	$(DOCKER_RUN) python scripts/train.py --config $(CONFIG)
+	$(DOCKER_RUN) python3 scripts/train.py --config $(CONFIG)
 
 train-1b:
 	@echo "Training 1B hybrid model..."
-	$(DOCKER_RUN) python scripts/train.py --config configs/1b_hybrid.yaml
+	$(DOCKER_RUN) python3 scripts/train.py --config configs/1b_hybrid.yaml
 
 train-resume:
 	@if [ -z "$(CKPT)" ]; then \
@@ -151,7 +151,7 @@ train-resume:
 		exit 1; \
 	fi
 	@echo "Resuming training from: $(CKPT)"
-	$(DOCKER_RUN) python scripts/train.py --resume $(CKPT)
+	$(DOCKER_RUN) python3 scripts/train.py --resume $(CKPT)
 
 # Evaluation operations
 eval:
@@ -160,19 +160,19 @@ eval:
 		exit 1; \
 	fi
 	@echo "Evaluating checkpoint: $(CKPT)"
-	$(DOCKER_RUN) python scripts/evaluate.py --checkpoint $(CKPT)
+	$(DOCKER_RUN) python3 scripts/evaluate.py --checkpoint $(CKPT)
 
 eval-all:
 	@echo "Running full benchmark suite..."
-	$(DOCKER_RUN) python scripts/evaluate.py --checkpoint $(CKPT) --benchmarks all
+	$(DOCKER_RUN) python3 scripts/evaluate.py --checkpoint $(CKPT) --benchmarks all
 
 eval-mmlu:
 	@echo "Evaluating on MMLU..."
-	$(DOCKER_RUN) python scripts/evaluate.py --checkpoint $(CKPT) --benchmarks mmlu
+	$(DOCKER_RUN) python3 scripts/evaluate.py --checkpoint $(CKPT) --benchmarks mmlu
 
 eval-math:
 	@echo "Evaluating on math benchmarks..."
-	$(DOCKER_RUN) python scripts/evaluate.py --checkpoint $(CKPT) --benchmarks math,gsm8k
+	$(DOCKER_RUN) python3 scripts/evaluate.py --checkpoint $(CKPT) --benchmarks math,gsm8k
 
 # Experiment 1: P-adic structure probe
 probe-smoke:
@@ -216,7 +216,7 @@ probe-quick:
 benchmark-smoke:
 	@echo "Running geometry benchmark smoke test (3 samples)..."
 	@mkdir -p results
-	$(DOCKER_RUN) python scripts/run_geometry_benchmark.py \
+	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples 3 \
@@ -242,7 +242,7 @@ benchmark-full:
 	echo "  Layer: $$LAYER, Head: $$HEAD"; \
 	echo "  Samples: $$SAMPLES, Pairs: 500"; \
 	mkdir -p results; \
-	$(DOCKER_RUN) python scripts/run_geometry_benchmark.py \
+	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples $$SAMPLES \
@@ -256,7 +256,7 @@ benchmark-full:
 # Leaderboard submission
 submit-openllm:
 	@echo "Submitting to Open LLM Leaderboard..."
-	$(DOCKER_RUN) python scripts/submit_to_leaderboard.py --platform openllm --checkpoint $(CKPT)
+	$(DOCKER_RUN) python3 scripts/submit_to_leaderboard.py --platform openllm --checkpoint $(CKPT)
 
 # Utilities
 clean:
