@@ -46,7 +46,7 @@ class TestEuclideanMetric:
         distances = metric.compute_pairwise(keys, values, pairs)
 
         expected = np.sqrt(2.0)
-        assert torch.allclose(distances, torch.tensor([expected]), atol=1e-5)
+        assert distances[0].item() == pytest.approx(expected, abs=1e-5)
 
 
 class TestCosineSimilarity:
@@ -165,7 +165,7 @@ class TestSphericalRadial:
 
         # log(5) - log(1) = log(5) ≈ 1.609
         expected_radial = np.log(5.0)
-        assert torch.allclose(radial_dist, torch.tensor([expected_radial]), atol=0.01)
+        assert radial_dist[0].item() == pytest.approx(expected_radial, abs=0.01)
 
     def test_orthogonal_same_norm(self):
         """
@@ -508,7 +508,7 @@ class TestGroundTruthWithQueryPositions:
         # We can't verify exact values without knowing attention, but we can verify:
         # 1. No NaN values
         assert not torch.isnan(damage).any()
-        # 2. All values are non-negative (KL divergence is non-negative)
+        # 2. All values are non-negative (L2 output damage is non-negative)
         assert torch.all(damage >= 0)
 
     def test_merge_damage_with_query_positions(self):
