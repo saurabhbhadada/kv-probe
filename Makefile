@@ -23,7 +23,8 @@ help:
 	@echo "Development:"
 	@echo "  make jupyter        - Start Jupyter Lab (port 8888)"
 	@echo "  make tensorboard    - Start TensorBoard (port 6006)"
-	@echo "  make test           - Run pytest tests"
+	@echo "  make test           - Run all pytest tests"
+	@echo "  make test-geometry  - Run geometry tests only"
 	@echo ""
 	@echo "Data & Training:"
 	@echo "  make download       - Download datasets"
@@ -34,6 +35,11 @@ help:
 	@echo "  make probe-smoke    - Run smoke test for p-adic probe"
 	@echo "  make probe-exp1     - Run Experiment 1 (2000 samples, 1000 pairs)"
 	@echo "  make probe-quick    - Quick probe test (200 samples, 100 pairs)"
+	@echo ""
+	@echo "Geometry Benchmarks:"
+	@echo "  make benchmark-smoke           - Run smoke test (3 samples)"
+	@echo "  make benchmark-full            - Run full benchmark (100 samples)"
+	@echo "  make benchmark-full LAYER=10 HEAD=0 SAMPLES=200  - Custom params"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make clean          - Clean up Docker resources"
@@ -84,8 +90,12 @@ tensorboard:
 		tensorboard --logdir=/workspace/padic-transformers/results --host=0.0.0.0
 
 test:
-	@echo "Running tests..."
+	@echo "Running all tests..."
 	$(DOCKER_RUN) pytest tests/ -v
+
+test-geometry:
+	@echo "Running geometry tests..."
+	$(DOCKER_RUN) pytest tests/test_geometries.py -v
 
 # Data operations
 download:
@@ -201,6 +211,47 @@ probe-quick:
 		--num-pairs 100 \
 		--n-bootstrap 100 \
 		--output results/probe_quick_layer$${LAYER}.json
+
+# Geometry benchmark experiments
+benchmark-smoke:
+	@echo "Running geometry benchmark smoke test (3 samples)..."
+	@mkdir -p results
+	$(DOCKER_RUN) python scripts/run_geometry_benchmark.py \
+		--model pythia-410m \
+		--dataset wikitext \
+		--num-samples 3 \
+		--layer 5 \
+		--head 0 \
+		--num-pairs 100 \
+		--future-horizon 64 \
+		--min-future-queries 32 \
+		--output results/smoke_test.csv
+
+benchmark-full:
+	@if [ -z "$(LAYER)" ]; then \
+		LAYER=10; \
+	fi; \
+	if [ -z "$(HEAD)" ]; then \
+		HEAD=0; \
+	fi; \
+	if [ -z "$(SAMPLES)" ]; then \
+		SAMPLES=100; \
+	fi; \
+	echo "Running full geometry benchmark..."; \
+	echo "  Model: pythia-410m"; \
+	echo "  Layer: $$LAYER, Head: $$HEAD"; \
+	echo "  Samples: $$SAMPLES, Pairs: 500"; \
+	mkdir -p results; \
+	$(DOCKER_RUN) python scripts/run_geometry_benchmark.py \
+		--model pythia-410m \
+		--dataset wikitext \
+		--num-samples $$SAMPLES \
+		--layer $$LAYER \
+		--head $$HEAD \
+		--num-pairs 500 \
+		--future-horizon 64 \
+		--min-future-queries 32 \
+		--output results/benchmark_L$${LAYER}_H$${HEAD}.csv
 
 # Leaderboard submission
 submit-openllm:
