@@ -727,5 +727,83 @@ class TestQKReconstruction:
             )
 
 
+class TestPadicQuantization:
+    """Test p-adic quantization with float16 inputs."""
+
+    def test_float16_precision16_no_overflow(self):
+        """Test that float16 input with precision=16 does not overflow."""
+        from src.geometries.padic import float_to_2adic
+
+        # Create float16 tensor with values near the range limits
+        x = torch.tensor([1.0, -1.0, 0.5, -0.5, 0.0], dtype=torch.float16)
+
+        # This should not raise an overflow error
+        x_2adic, scale = float_to_2adic(x, precision=16)
+
+        # Verify output shape and dtype
+        assert x_2adic.shape == x.shape
+        assert x_2adic.dtype == torch.int32  # Should be int32, not int16
+
+        # Verify range: all values should be in [0, 2^16 - 1]
+        assert torch.all(x_2adic >= 0)
+        assert torch.all(x_2adic < 65536)
+
+    def test_float16_large_values(self):
+        """Test float16 with large values near FP16 max."""
+        from src.geometries.padic import float_to_2adic
+
+        # Values near float16 max (~65504)
+        x = torch.tensor([100.0, -100.0, 50.0, 0.0], dtype=torch.float16)
+
+        x_2adic, scale = float_to_2adic(x, precision=16)
+
+        # Should not overflow
+        assert x_2adic.dtype == torch.int32
+        assert torch.all(x_2adic >= 0)
+        assert torch.all(x_2adic < 65536)
+
+    def test_negative_values_quantization(self):
+        """Test that negative values are correctly quantized."""
+        from src.geometries.padic import float_to_2adic
+
+        x = torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=torch.float32)
+        x_2adic, scale = float_to_2adic(x, precision=8)
+
+        # All quantized values should be in valid range
+        assert torch.all(x_2adic >= 0)
+        assert torch.all(x_2adic < 256)
+
+        # Negative values should map to lower half of range
+        # -1.0 should map to 0 (or very close)
+        # +1.0 should map to 255 (or very close)
+        assert x_2adic[0].item() < 10  # -1.0 near 0
+        assert x_2adic[4].item() > 245  # +1.0 near 255
+
+    def test_output_range_bounds(self):
+        """Test that output satisfies 0 <= x_2adic < 2^precision."""
+        from src.geometries.padic import float_to_2adic
+
+        for precision in [8, 12, 16, 20]:
+            x = torch.randn(100, dtype=torch.float32)
+            x_2adic, scale = float_to_2adic(x, precision=precision)
+
+            modulus = 2 ** precision
+            assert torch.all(x_2adic >= 0), f"Negative values found for precision={precision}"
+            assert torch.all(x_2adic < modulus), f"Values >= modulus found for precision={precision}"
+
+    def test_no_wraparound(self):
+        """Test that maximum values don't wrap around to zero."""
+        from src.geometries.padic import float_to_2adic
+
+        # Create tensor with max value
+        x = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+        x_2adic, scale = float_to_2adic(x, precision=16)
+
+        # Max values should map to near modulus-1, NOT wrap to 0
+        modulus = 65536
+        assert torch.all(x_2adic > modulus - 100), \
+            f"Max values wrapped around: {x_2adic}, expected near {modulus-1}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

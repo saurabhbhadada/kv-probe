@@ -36,7 +36,7 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     4. Return quantized tensor and scale factor
 
     Args:
-        x: Input tensor (float32 or bfloat16)
+        x: Input tensor (float16, float32, or bfloat16)
         precision: Number of bits for 2-adic representation (1-32)
 
     Returns:
@@ -50,16 +50,21 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     """
     modulus = 2 ** precision
 
+    # Convert to float32 for all quantization math to avoid overflow
+    # (float16 max ~65504 cannot represent modulus-1 for precision=16)
+    x_work = x.to(torch.float32)
+
     # Dynamic range quantization: use actual max absolute value
     # This preserves the range of K/V values in transformers
-    max_val = torch.abs(x).max()
+    max_val = x_work.abs().max()
 
     # Choose appropriate dtype based on precision
+    # IMPORTANT: For precision <= 16, use int32 (not int16) because
+    # we need to represent range [0, 65535] for precision=16
     if precision <= 8:
         dtype = torch.uint8
-    elif precision <= 16:
-        dtype = torch.int16
     else:
+        # Use int32 for all larger precisions to avoid overflow
         dtype = torch.int32
 
     # Avoid division by zero - use small epsilon for numerical stability
@@ -71,16 +76,16 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     max_val = max_val + eps
 
     # Scale to [-1, 1] based on actual range, then to [0, modulus-1]
-    x_normalized = x / max_val  # Now in [-1, 1]
-    x_scaled = ((x_normalized + 1.0) * (modulus / 2.0))
+    x_normalized = x_work / max_val  # Now in [-1, 1]
+    x_scaled = (x_normalized + 1.0) * (modulus / 2.0)
 
     # Clamp to [0, modulus-1] to prevent wraparound bug
     # Without this, max values (1.0) map to modulus, which wraps to 0 (maps to -1.0)!
-    x_scaled = torch.clamp(x_scaled, 0, modulus - 1)
+    x_scaled = torch.clamp(x_scaled, 0.0, float(modulus - 1))
 
-    # Convert to appropriate integer type
-    x_int = x_scaled.to(torch.int32)  # Use int32 for intermediate computation
-    x_2adic = (x_int % modulus).to(dtype)  # Cast to target dtype
+    # Convert through int64 for safety, then take modulo
+    x_int = torch.round(x_scaled).to(torch.int64)
+    x_2adic = (x_int % modulus).to(dtype)
 
     return x_2adic, max_val
 
