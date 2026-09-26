@@ -24,7 +24,7 @@ make shell
 watch -n 1 nvidia-smi
 ```
 
-## 3. Run Full Benchmark
+## 3. Run Full Benchmark (Single Head)
 
 Default (100 samples, layer 10, head 0):
 ```bash
@@ -36,7 +36,20 @@ Custom parameters:
 make benchmark-full LAYER=5 HEAD=2 SAMPLES=200
 ```
 
-## 4. Run Across Multiple Heads
+## 4. Benchmark All Heads in One Layer
+
+Process all heads in a single run (more efficient than looping):
+```bash
+# Default: layer 5, 200 samples
+make benchmark-layer
+
+# Custom layer and samples
+make benchmark-layer LAYER=10 SAMPLES=100
+```
+
+Output: `results/benchmark_L{LAYER}_all_heads.csv` with rows for all heads (0-15 for pythia-410m)
+
+## 5. Run Multiple Individual Heads (if needed)
 
 ```bash
 for head in 0 1 2 3; do
@@ -44,11 +57,11 @@ for head in 0 1 2 3; do
 done
 ```
 
-## 5. Direct Python Command (if needed)
+## 6. Direct Python Command (if needed)
 
 If you need more control, use `make exec`:
 ```bash
-make exec CMD="python scripts/run_geometry_benchmark.py \
+make exec CMD="python3 scripts/run_geometry_benchmark.py \
   --model pythia-410m \
   --dataset wikitext \
   --num-samples 100 \
@@ -58,7 +71,7 @@ make exec CMD="python scripts/run_geometry_benchmark.py \
   --output results/custom.csv"
 ```
 
-## 6. View Results
+## 7. View Results
 
 ```bash
 # From host

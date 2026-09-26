@@ -59,11 +59,9 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     max_val = x_work.abs().max()
 
     # Choose appropriate dtype based on precision
-    # IMPORTANT: For precision <= 16, use int32 (not int16) because
-    # we need to represent range [0, 65535] for precision=16
-    if precision <= 8:
-        dtype = torch.uint8
-    elif precision <= 31:
+    # Use int32 for all precisions up to 31 to avoid uint8/int16 overflow issues
+    # in comparisons and arithmetic operations
+    if precision <= 31:
         dtype = torch.int32
     else:
         dtype = torch.int64

@@ -1,4 +1,4 @@
-.PHONY: help build up down shell jupyter tensorboard train eval test download clean logs probe-smoke probe-exp1 probe-quick
+.PHONY: help build up down shell jupyter tensorboard train eval test download clean logs probe-smoke probe-exp1 probe-quick benchmark-smoke benchmark-full benchmark-layer
 
 # Project configuration
 PROJECT_NAME := kv-probe
@@ -38,8 +38,10 @@ help:
 	@echo ""
 	@echo "Geometry Benchmarks:"
 	@echo "  make benchmark-smoke           - Run smoke test (3 samples)"
-	@echo "  make benchmark-full            - Run full benchmark (100 samples)"
+	@echo "  make benchmark-full            - Run full benchmark (100 samples, single head)"
 	@echo "  make benchmark-full LAYER=10 HEAD=0 SAMPLES=200  - Custom params"
+	@echo "  make benchmark-layer           - Benchmark all heads in one layer (default: L5, 200 samples)"
+	@echo "  make benchmark-layer LAYER=10 SAMPLES=100        - Custom layer and samples"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make clean          - Clean up Docker resources"
@@ -252,6 +254,28 @@ benchmark-full:
 		--future-horizon 64 \
 		--min-future-queries 32 \
 		--output results/benchmark_L$${LAYER}_H$${HEAD}.csv
+
+benchmark-layer:
+	@if [ -z "$(LAYER)" ]; then \
+		LAYER=5; \
+	fi; \
+	if [ -z "$(SAMPLES)" ]; then \
+		SAMPLES=200; \
+	fi; \
+	echo "Running geometry benchmark for all heads in layer $$LAYER..."; \
+	echo "  Model: pythia-410m"; \
+	echo "  Layer: $$LAYER (all heads)"; \
+	echo "  Samples: $$SAMPLES, Pairs: 500"; \
+	mkdir -p results; \
+	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+		--model pythia-410m \
+		--dataset wikitext \
+		--num-samples $$SAMPLES \
+		--layer $$LAYER \
+		--num-pairs 500 \
+		--future-horizon 64 \
+		--min-future-queries 32 \
+		--output results/benchmark_L$${LAYER}_all_heads.csv
 
 # Leaderboard submission
 submit-openllm:
