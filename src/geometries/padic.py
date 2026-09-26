@@ -63,9 +63,10 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     # we need to represent range [0, 65535] for precision=16
     if precision <= 8:
         dtype = torch.uint8
-    else:
-        # Use int32 for all larger precisions to avoid overflow
+    elif precision <= 31:
         dtype = torch.int32
+    else:
+        dtype = torch.int64
 
     # Avoid division by zero - use small epsilon for numerical stability
     eps = 1e-8
@@ -438,7 +439,7 @@ class PadicSimilarityMetric(GeometryMetric):
         kj_quant = keys_quantized[j_indices]  # [num_pairs, d_model]
 
         # Compute differences
-        diff = ki_quant.to(torch.int32) - kj_quant.to(torch.int32)  # [num_pairs, d_model]
+        diff = ki_quant.to(torch.int64) - kj_quant.to(torch.int64)  # [num_pairs, d_model]
 
         # Compute p-adic valuations
         valuations = _padic_valuation(diff, prime=self.prime, precision=self.precision)  # [num_pairs, d_model]
