@@ -793,6 +793,9 @@ def main():
     results_df.to_csv(output_path, index=False)
     print(f"\n✓ Detailed results saved to: {output_path}")
 
+    # Prepare aggregate statistics for saving
+    aggregate_rows = []
+
     # Compute aggregate statistics
     print("\n" + "="*80)
     print("AGGREGATE RESULTS")
@@ -830,6 +833,8 @@ def main():
 
                 # Compute AUROC / AUPRC for classification
                 # Threshold ground truth at median to create binary labels
+                auroc = None
+                auprc = None
                 if gt == 'future_attention_similarity':
                     # High similarity = safe to merge (positive class)
                     y_binary = (y > np.median(y)).astype(int)
@@ -862,6 +867,19 @@ def main():
                         print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
                 else:
                     print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
+
+                # Save overall statistics to aggregates (layer=-1, head=-1 for overall)
+                aggregate_rows.append({
+                    'layer': -1,
+                    'head': -1,
+                    'geometry': geom_col,
+                    'ground_truth': gt,
+                    'n': mask.sum(),
+                    'pearson': pearson_r,
+                    'spearman': spearman_r,
+                    'auroc': auroc,
+                    'auprc': auprc,
+                })
             except:
                 pass
 
@@ -896,8 +914,42 @@ def main():
                 y = group_df.loc[mask, gt].values
 
                 try:
+                    pearson_r, _ = pearsonr(x, y)
                     spearman_r, _ = spearmanr(x, y)
                     abs_spearman = abs(spearman_r)
+
+                    # Compute AUROC/AUPRC
+                    auroc = None
+                    auprc = None
+                    if gt == 'future_attention_similarity':
+                        y_binary = (y > np.median(y)).astype(int)
+                    elif 'damage' in gt:
+                        y_binary = (y < np.median(y)).astype(int)
+                    else:
+                        y_binary = None
+
+                    if y_binary is not None:
+                        is_similarity = GEOMETRY_METADATA.get(geom_col, False)
+                        scores = x if is_similarity else -x
+                        try:
+                            auroc = roc_auc_score(y_binary, scores)
+                            auprc = average_precision_score(y_binary, scores)
+                        except:
+                            pass
+
+                    # Save to aggregates
+                    aggregate_rows.append({
+                        'layer': layer_id,
+                        'head': head_id,
+                        'geometry': geom_col,
+                        'ground_truth': gt,
+                        'n': mask.sum(),
+                        'pearson': pearson_r,
+                        'spearman': spearman_r,
+                        'auroc': auroc,
+                        'auprc': auprc,
+                    })
+
                     if abs_spearman > best_abs_spearman:
                         best_abs_spearman = abs_spearman
                         best_spearman = spearman_r
@@ -907,6 +959,13 @@ def main():
 
             if best_geom:
                 print(f"  Best for {gt}: {best_geom} (ρ={best_spearman:+.3f})")
+
+    # Save aggregate statistics
+    if aggregate_rows:
+        aggregates_df = pd.DataFrame(aggregate_rows)
+        aggregates_path = output_path.parent / (output_path.stem + '_aggregates.csv')
+        aggregates_df.to_csv(aggregates_path, index=False)
+        print(f"\n✓ Aggregate statistics saved to: {aggregates_path}")
 
     print("\n✓ Benchmark complete!")
 
