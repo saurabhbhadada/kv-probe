@@ -45,23 +45,40 @@ make benchmark-layer
 
 # Custom layer and samples
 make benchmark-layer LAYER=10 SAMPLES=100
+
+# Specify GPU (inside Docker: 0 or 1, maps to host GPUs 5 and 6)
+make benchmark-layer LAYER=10 SAMPLES=100 GPU=0
 ```
 
 Output: `results/benchmark_L{LAYER}_all_heads.csv` with rows for all heads (0-15 for pythia-410m)
 
-## 5. Run Multiple Individual Heads (if needed)
+## 5. Run Parallel Benchmarks on Different GPUs
+
+**Terminal 1:**
+```bash
+make benchmark-layer LAYER=5 SAMPLES=1000 GPU=0
+```
+
+**Terminal 2:**
+```bash
+make benchmark-layer LAYER=10 SAMPLES=1000 GPU=1
+```
+
+Both will run overnight in parallel on separate GPUs.
+
+## 6. Run Multiple Individual Heads (if needed)
 
 ```bash
 for head in 0 1 2 3; do
-  make benchmark-full LAYER=10 HEAD=$head SAMPLES=100
+  make benchmark-full LAYER=10 HEAD=$head SAMPLES=100 GPU=0
 done
 ```
 
-## 6. Direct Python Command (if needed)
+## 7. Direct Python Command (if needed)
 
 If you need more control, use `make exec`:
 ```bash
-make exec CMD="python3 scripts/run_geometry_benchmark.py \
+make exec CMD="CUDA_VISIBLE_DEVICES=0 python3 scripts/run_geometry_benchmark.py \
   --model pythia-410m \
   --dataset wikitext \
   --num-samples 100 \
@@ -71,7 +88,7 @@ make exec CMD="python3 scripts/run_geometry_benchmark.py \
   --output results/custom.csv"
 ```
 
-## 7. View Results
+## 8. View Results
 
 ```bash
 # From host

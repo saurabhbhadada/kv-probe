@@ -38,10 +38,11 @@ help:
 	@echo ""
 	@echo "Geometry Benchmarks:"
 	@echo "  make benchmark-smoke           - Run smoke test (3 samples)"
+	@echo "  make benchmark-smoke GPU=0     - Run on specific GPU"
 	@echo "  make benchmark-full            - Run full benchmark (100 samples, single head)"
-	@echo "  make benchmark-full LAYER=10 HEAD=0 SAMPLES=200  - Custom params"
+	@echo "  make benchmark-full LAYER=10 HEAD=0 SAMPLES=200 GPU=0  - Custom params"
 	@echo "  make benchmark-layer           - Benchmark all heads in one layer (default: L5, 200 samples)"
-	@echo "  make benchmark-layer LAYER=10 SAMPLES=100        - Custom layer and samples"
+	@echo "  make benchmark-layer LAYER=10 SAMPLES=100 GPU=1        - Custom layer and GPU"
 	@echo ""
 	@echo "Utilities:"
 	@echo "  make clean          - Clean up Docker resources"
@@ -216,9 +217,16 @@ probe-quick:
 
 # Geometry benchmark experiments
 benchmark-smoke:
-	@echo "Running geometry benchmark smoke test (3 samples)..."
-	@mkdir -p results
-	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	@if [ -z "$(GPU)" ]; then \
+		GPU_PREFIX=""; \
+		GPU_MSG="default"; \
+	else \
+		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_MSG="GPU $(GPU)"; \
+	fi; \
+	echo "Running geometry benchmark smoke test (3 samples) on $$GPU_MSG..."; \
+	mkdir -p results; \
+	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples 3 \
@@ -239,12 +247,19 @@ benchmark-full:
 	if [ -z "$(SAMPLES)" ]; then \
 		SAMPLES=100; \
 	fi; \
-	echo "Running full geometry benchmark..."; \
+	if [ -z "$(GPU)" ]; then \
+		GPU_PREFIX=""; \
+		GPU_MSG="default"; \
+	else \
+		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_MSG="GPU $(GPU)"; \
+	fi; \
+	echo "Running full geometry benchmark on $$GPU_MSG..."; \
 	echo "  Model: pythia-410m"; \
 	echo "  Layer: $$LAYER, Head: $$HEAD"; \
 	echo "  Samples: $$SAMPLES, Pairs: 500"; \
 	mkdir -p results; \
-	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples $$SAMPLES \
@@ -262,12 +277,19 @@ benchmark-layer:
 	if [ -z "$(SAMPLES)" ]; then \
 		SAMPLES=200; \
 	fi; \
-	echo "Running geometry benchmark for all heads in layer $$LAYER..."; \
+	if [ -z "$(GPU)" ]; then \
+		GPU_PREFIX=""; \
+		GPU_MSG="default"; \
+	else \
+		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_MSG="GPU $(GPU)"; \
+	fi; \
+	echo "Running geometry benchmark for all heads in layer $$LAYER on $$GPU_MSG..."; \
 	echo "  Model: pythia-410m"; \
 	echo "  Layer: $$LAYER (all heads)"; \
 	echo "  Samples: $$SAMPLES, Pairs: 500"; \
 	mkdir -p results; \
-	$(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples $$SAMPLES \
