@@ -218,15 +218,21 @@ probe-quick:
 # Geometry benchmark experiments
 benchmark-smoke:
 	@if [ -z "$(GPU)" ]; then \
-		GPU_PREFIX=""; \
-		GPU_MSG="default"; \
+		GPU_ENV=""; \
+		GPU_MSG="default GPU"; \
 	else \
-		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_ENV="-e CUDA_VISIBLE_DEVICES=$(GPU)"; \
 		GPU_MSG="GPU $(GPU)"; \
 	fi; \
+	if [ -z "$(TAG)" ]; then \
+		OUTPUT_FILE="results/smoke_test.csv"; \
+	else \
+		OUTPUT_FILE="results/smoke_test_$(TAG).csv"; \
+	fi; \
 	echo "Running geometry benchmark smoke test (3 samples) on $$GPU_MSG..."; \
+	echo "Output: $$OUTPUT_FILE"; \
 	mkdir -p results; \
-	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	docker-compose run --rm $$GPU_ENV kv-probe-dev python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples 3 \
@@ -235,7 +241,7 @@ benchmark-smoke:
 		--num-pairs 100 \
 		--future-horizon 64 \
 		--min-future-queries 32 \
-		--output results/smoke_test.csv
+		--output $$OUTPUT_FILE
 
 benchmark-full:
 	@if [ -z "$(LAYER)" ]; then \
@@ -248,18 +254,24 @@ benchmark-full:
 		SAMPLES=100; \
 	fi; \
 	if [ -z "$(GPU)" ]; then \
-		GPU_PREFIX=""; \
-		GPU_MSG="default"; \
+		GPU_ENV=""; \
+		GPU_MSG="default GPU"; \
 	else \
-		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_ENV="-e CUDA_VISIBLE_DEVICES=$(GPU)"; \
 		GPU_MSG="GPU $(GPU)"; \
+	fi; \
+	if [ -z "$(TAG)" ]; then \
+		OUTPUT_FILE="results/benchmark_L$${LAYER}_H$${HEAD}.csv"; \
+	else \
+		OUTPUT_FILE="results/benchmark_L$${LAYER}_H$${HEAD}_$(TAG).csv"; \
 	fi; \
 	echo "Running full geometry benchmark on $$GPU_MSG..."; \
 	echo "  Model: pythia-410m"; \
 	echo "  Layer: $$LAYER, Head: $$HEAD"; \
 	echo "  Samples: $$SAMPLES, Pairs: 500"; \
+	echo "  Output: $$OUTPUT_FILE"; \
 	mkdir -p results; \
-	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	docker-compose run --rm $$GPU_ENV kv-probe-dev python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples $$SAMPLES \
@@ -268,7 +280,7 @@ benchmark-full:
 		--num-pairs 500 \
 		--future-horizon 64 \
 		--min-future-queries 32 \
-		--output results/benchmark_L$${LAYER}_H$${HEAD}.csv
+		--output $$OUTPUT_FILE
 
 benchmark-layer:
 	@if [ -z "$(LAYER)" ]; then \
@@ -278,18 +290,24 @@ benchmark-layer:
 		SAMPLES=200; \
 	fi; \
 	if [ -z "$(GPU)" ]; then \
-		GPU_PREFIX=""; \
-		GPU_MSG="default"; \
+		GPU_ENV=""; \
+		GPU_MSG="default GPU"; \
 	else \
-		GPU_PREFIX="CUDA_VISIBLE_DEVICES=$(GPU)"; \
+		GPU_ENV="-e CUDA_VISIBLE_DEVICES=$(GPU)"; \
 		GPU_MSG="GPU $(GPU)"; \
+	fi; \
+	if [ -z "$(TAG)" ]; then \
+		OUTPUT_FILE="results/benchmark_L$${LAYER}_all_heads.csv"; \
+	else \
+		OUTPUT_FILE="results/benchmark_L$${LAYER}_all_heads_$(TAG).csv"; \
 	fi; \
 	echo "Running geometry benchmark for all heads in layer $$LAYER on $$GPU_MSG..."; \
 	echo "  Model: pythia-410m"; \
 	echo "  Layer: $$LAYER (all heads)"; \
 	echo "  Samples: $$SAMPLES, Pairs: 500"; \
+	echo "  Output: $$OUTPUT_FILE"; \
 	mkdir -p results; \
-	$$GPU_PREFIX $(DOCKER_RUN) python3 scripts/run_geometry_benchmark.py \
+	docker-compose run --rm $$GPU_ENV kv-probe-dev python3 scripts/run_geometry_benchmark.py \
 		--model pythia-410m \
 		--dataset wikitext \
 		--num-samples $$SAMPLES \
@@ -297,7 +315,7 @@ benchmark-layer:
 		--num-pairs 500 \
 		--future-horizon 64 \
 		--min-future-queries 32 \
-		--output results/benchmark_L$${LAYER}_all_heads.csv
+		--output $$OUTPUT_FILE
 
 # Leaderboard submission
 submit-openllm:

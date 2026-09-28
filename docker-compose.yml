@@ -8,13 +8,15 @@ services:
     image: kv-probe:latest
     container_name: kv-probe-dev
 
-    # GPU configuration - only GPUs 5 and 6
+    # GPU configuration
+    # device_ids refer to HOST GPU IDs (e.g., '5', '6' for host GPUs 5 and 6)
+    # Inside container, they appear as CUDA devices 0, 1, 2, etc. in order
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0', '1']
+              device_ids: ['5', '6']  # Host GPUs 5 and 6 → container GPUs 0 and 1
               capabilities: [gpu]
 
     # Mount project directory

@@ -863,8 +863,8 @@ def main():
                         auroc = roc_auc_score(y_binary, scores)
                         auprc = average_precision_score(y_binary, scores)
                         print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f} | AUROC: {auroc:.3f} | AUPRC: {auprc:.3f}")
-                    except:
-                        print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
+                    except Exception as e:
+                        print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f} (AUROC/AUPRC failed: {e})")
                 else:
                     print(f"  {geom_col:30s} | Pearson: {pearson_r:+.3f} | Spearman: {spearman_r:+.3f}")
 
@@ -880,8 +880,8 @@ def main():
                     'auroc': auroc,
                     'auprc': auprc,
                 })
-            except:
-                pass
+            except Exception as e:
+                print(f"  ERROR computing overall stats for {geom_col} vs {gt}: {e}")
 
     # Per layer × head analysis
     print("\n" + "="*80)
@@ -934,8 +934,8 @@ def main():
                         try:
                             auroc = roc_auc_score(y_binary, scores)
                             auprc = average_precision_score(y_binary, scores)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"  WARNING: AUROC/AUPRC failed for layer={layer_id}, head={head_id}, {geom_col} vs {gt}: {e}")
 
                     # Save to aggregates
                     aggregate_rows.append({
@@ -954,8 +954,8 @@ def main():
                         best_abs_spearman = abs_spearman
                         best_spearman = spearman_r
                         best_geom = geom_col
-                except:
-                    pass
+                except Exception as e:
+                    print(f"  ERROR computing stats for layer={layer_id}, head={head_id}, {geom_col} vs {gt}: {e}")
 
             if best_geom:
                 print(f"  Best for {gt}: {best_geom} (ρ={best_spearman:+.3f})")
