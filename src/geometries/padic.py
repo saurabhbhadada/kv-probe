@@ -50,14 +50,6 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
     """
     modulus = 2 ** precision
 
-    # Convert to float32 for all quantization math to avoid overflow
-    # (float16 max ~65504 cannot represent modulus-1 for precision=16)
-    x_work = x.to(torch.float32)
-
-    # Dynamic range quantization: use actual max absolute value
-    # This preserves the range of K/V values in transformers
-    max_val = x_work.abs().max()
-
     # Choose appropriate dtype based on precision
     # Use int32 for all precisions up to 31 to avoid uint8/int16 overflow issues
     # in comparisons and arithmetic operations
@@ -65,6 +57,21 @@ def float_to_2adic(x: torch.Tensor, precision: int = 8) -> Tuple[torch.Tensor, t
         dtype = torch.int32
     else:
         dtype = torch.int64
+
+    # Handle empty tensors
+    if x.numel() == 0:
+        return (
+            torch.empty_like(x, dtype=dtype),
+            torch.tensor(1.0, device=x.device, dtype=torch.float32),
+        )
+
+    # Convert to float32 for all quantization math to avoid overflow
+    # (float16 max ~65504 cannot represent modulus-1 for precision=16)
+    x_work = x.to(torch.float32)
+
+    # Dynamic range quantization: use actual max absolute value
+    # This preserves the range of K/V values in transformers
+    max_val = x_work.abs().max()
 
     # Avoid division by zero - use small epsilon for numerical stability
     eps = 1e-8
@@ -257,6 +264,12 @@ def ultrametric_distance(x: torch.Tensor, y: torch.Tensor, precision: int = 8) -
     # Higher valuation = smaller distance = more similar
     distance = 2.0 ** (-valuation.to(torch.float32))
 
+    # True p-adic semantics: d(x, x) = 0
+    # When diff = 0, valuation = precision (infinity), so distance = 2^(-precision) ≈ 0
+    # Explicitly set to exactly 0.0 for zero differences
+    zero_mask = (diff == 0)
+    distance[zero_mask] = 0.0
+
     return distance
 
 
@@ -273,6 +286,13 @@ def _2adic_norm(x: torch.Tensor, precision: int = 8) -> torch.Tensor:
     """
     valuation = _2adic_valuation(x, precision)
     norm = 2.0 ** (-valuation.to(torch.float32))
+
+    # True p-adic semantics: |0|_p = 0
+    # When x = 0, valuation = precision (infinity), so norm = 2^(-precision) ≈ 0
+    # Explicitly set to exactly 0.0 for zero inputs
+    zero_mask = (x == 0)
+    norm[zero_mask] = 0.0
+
     return norm
 
 

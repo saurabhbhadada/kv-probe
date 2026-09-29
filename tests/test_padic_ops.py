@@ -1,4 +1,12 @@
-"""Unit tests for 2-adic operations."""
+"""
+Unit tests for 2-adic operations.
+
+Current API:
+- float_to_2adic(x, precision) returns (quantized_tensor, scale)
+- _2adic_to_float(x_2adic, precision, scale) returns reconstructed tensor
+- Dynamic range quantization: scales to actual data range, not [-1, 1]
+- True p-adic semantics: |0|_p = 0, d(x,x) = 0
+"""
 
 import pytest
 import torch
@@ -23,9 +31,9 @@ class TestBasicConversion:
         """Test that float -> 2adic -> float preserves values approximately."""
         x = torch.tensor([0.5, -0.5, 0.0, 1.0, -1.0])
 
-        # Convert to 2-adic and back
-        x_2adic = float_to_2adic(x, precision=8)
-        x_reconstructed = _2adic_to_float(x_2adic, precision=8)
+        # Convert to 2-adic and back using current API
+        x_2adic, scale = float_to_2adic(x, precision=8)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=8, scale=scale)
 
         # Should be close (within quantization error)
         torch.testing.assert_close(x, x_reconstructed, atol=0.01, rtol=0.01)
@@ -35,8 +43,8 @@ class TestBasicConversion:
         x = torch.tensor([0.123, 0.456, 0.789])
 
         for precision in [4, 8, 12, 16]:
-            x_2adic = float_to_2adic(x, precision=precision)
-            x_reconstructed = _2adic_to_float(x_2adic, precision=precision)
+            x_2adic, scale = float_to_2adic(x, precision=precision)
+            x_reconstructed = _2adic_to_float(x_2adic, precision=precision, scale=scale)
 
             # Higher precision should give better accuracy
             max_error = (x - x_reconstructed).abs().max()
@@ -61,18 +69,19 @@ class TestBasicConversion:
         """Test that output has correct dtype."""
         x = torch.tensor([0.1, 0.2, 0.3])
 
-        x_2adic = float_to_2adic(x, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
         assert x_2adic.dtype == torch.int32, f"Expected int32, got {x_2adic.dtype}"
 
     def test_batch_processing(self):
         """Test that batched tensors work correctly."""
         x = torch.randn(4, 8, 128)  # Batch of matrices
 
-        x_2adic = float_to_2adic(x, precision=8)
-        x_reconstructed = _2adic_to_float(x_2adic, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=8, scale=scale)
 
         assert x_2adic.shape == x.shape, "Shape should be preserved"
-        torch.testing.assert_close(x.clamp(-1, 1), x_reconstructed, atol=0.02, rtol=0.02)
+        # With dynamic range quantization, original values should be preserved
+        torch.testing.assert_close(x, x_reconstructed, atol=0.02, rtol=0.02)
 
 
 class Test2adicValuation:
@@ -123,13 +132,13 @@ class TestUltrametricDistance:
         torch.testing.assert_close(d_xy, d_yx)
 
     def test_zero_distance(self):
-        """Test that d(x,x) = 0 (or very small)."""
+        """Test that d(x,x) = 0 exactly."""
         x = torch.tensor([10, 20, 30])
 
         d = ultrametric_distance(x, x, precision=8)
 
-        # Distance should be very small (close to 0)
-        assert d.max() < 1e-6, f"d(x,x) should be ~0, got {d}"
+        # Distance should be exactly 0 (true p-adic semantics)
+        assert (d == 0.0).all(), f"d(x,x) should be exactly 0, got {d}"
 
     def test_ultrametric_inequality(self):
         """Test strong triangle inequality: d(x,z) <= max(d(x,y), d(y,z))."""
@@ -169,12 +178,12 @@ class TestNorm:
 
         norm = _2adic_norm(x, precision=8)
 
-        # Norm should be positive
-        assert (norm > 0).all(), "Norm should be positive"
+        # Norm should be positive for non-zero values
+        assert (norm > 0).all(), "Norm should be positive for non-zero values"
 
-        # Norm of 0 should be 0 (or very small)
+        # Norm of 0 should be exactly 0 (true p-adic semantics)
         norm_zero = _2adic_norm(torch.tensor([0]), precision=8)
-        assert norm_zero.item() < 1e-6, "Norm of 0 should be ~0"
+        assert norm_zero.item() == 0.0, "Norm of 0 should be exactly 0"
 
 
 class TestEdgeCases:
@@ -184,8 +193,8 @@ class TestEdgeCases:
         """Test with extreme values."""
         x = torch.tensor([-1.0, -0.99, 0.99, 1.0])
 
-        x_2adic = float_to_2adic(x, precision=8)
-        x_reconstructed = _2adic_to_float(x_2adic, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=8, scale=scale)
 
         torch.testing.assert_close(x, x_reconstructed, atol=0.02, rtol=0.02)
 
@@ -193,8 +202,8 @@ class TestEdgeCases:
         """Test with very small values near zero."""
         x = torch.tensor([-0.01, -0.001, 0.0, 0.001, 0.01])
 
-        x_2adic = float_to_2adic(x, precision=16)  # Higher precision for small values
-        x_reconstructed = _2adic_to_float(x_2adic, precision=16)
+        x_2adic, scale = float_to_2adic(x, precision=16)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=16, scale=scale)
 
         torch.testing.assert_close(x, x_reconstructed, atol=0.001, rtol=0.1)
 
@@ -202,15 +211,16 @@ class TestEdgeCases:
         """Test with empty tensor."""
         x = torch.tensor([])
 
-        x_2adic = float_to_2adic(x, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
         assert x_2adic.shape == torch.Size([0]), "Empty tensor should remain empty"
+        assert scale.shape == torch.Size([]), "Scale should be a scalar"
 
     def test_single_element(self):
         """Test with single element."""
         x = torch.tensor([0.5])
 
-        x_2adic = float_to_2adic(x, precision=8)
-        x_reconstructed = _2adic_to_float(x_2adic, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=8, scale=scale)
 
         torch.testing.assert_close(x, x_reconstructed, atol=0.01, rtol=0.01)
 
@@ -223,10 +233,11 @@ class TestGPUCompat:
         """Test that operations work on CUDA tensors."""
         x = torch.tensor([0.1, 0.2, 0.3]).cuda()
 
-        x_2adic = float_to_2adic(x, precision=8)
-        x_reconstructed = _2adic_to_float(x_2adic, precision=8)
+        x_2adic, scale = float_to_2adic(x, precision=8)
+        x_reconstructed = _2adic_to_float(x_2adic, precision=8, scale=scale)
 
         assert x_2adic.is_cuda, "Output should be on CUDA"
+        assert scale.is_cuda, "Scale should be on CUDA"
         torch.testing.assert_close(x, x_reconstructed, atol=0.02, rtol=0.02)
 
 
