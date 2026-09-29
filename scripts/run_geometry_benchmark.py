@@ -18,6 +18,7 @@ Usage:
 import argparse
 import sys
 import os
+import time
 from pathlib import Path
 
 # Module-level storage for geometry metadata
@@ -327,7 +328,7 @@ def run_benchmark_single_head(
     """
     Run benchmark for a single (layer, head, sample).
 
-    Processes one sample at a time on CPU to save memory.
+    Processes computation on GPU for performance.
 
     Args:
         min_future_queries: Minimum number of future queries required to evaluate a pair.
@@ -337,22 +338,22 @@ def run_benchmark_single_head(
     Returns:
         DataFrame with one row per pair, columns for all metrics + ground truth
     """
-    # keys: [batch=1, heads, seq, dim]
-    # Move to CPU for processing (one sample at a time is more memory-efficient)
-    keys = keys.cpu()
-    values = values.cpu()
-    queries = queries.cpu()
-    attentions = attentions.cpu()
+    t_start = time.time()
 
-    # Extract for this head
-    K = keys[0, head_idx, :, :]  # [seq, dim]
-    V = values[0, head_idx, :, :]  # [seq, dim]
-    Q = queries[0, head_idx, :, :]  # [seq, dim]
-    A = attentions[0, head_idx, :, :]  # [seq, seq]
+    # keys: [batch=1, heads, seq, dim]
+    # Select head FIRST while on GPU, then convert to float32 for numerical stability
+    K = keys[0, head_idx, :, :].float()  # [seq, dim]
+    V = values[0, head_idx, :, :].float()  # [seq, dim]
+    Q = queries[0, head_idx, :, :].float()  # [seq, dim]
+    A = attentions[0, head_idx, :, :].float()  # [seq, seq]
 
     seq_len, d_model = K.shape
     device = K.device
     head_dim = d_model
+
+    # Print device info on first sample
+    if sample_id == 0 and head_idx == 0:
+        print(f"Benchmark running on device: {device}")
 
     # Sanity check: verify Q @ K^T reconstruction
     # CRITICAL: This MUST pass for valid Q extraction - fails hard on error
@@ -406,6 +407,7 @@ def run_benchmark_single_head(
         print("Warning: Could not import p-adic metric")
 
     # Compute non-query geometry metrics (don't need queries)
+    t_non_query_start = time.time()
     for geom in non_query_geometries:
         try:
             # Store metadata in global dict
@@ -427,7 +429,10 @@ def run_benchmark_single_head(
             print(f"  Traceback: {traceback.format_exc()}")
             results[geom.name] = [np.nan] * num_actual_pairs
 
-    # Query-aware geometries: compute per-pair with appropriate query windows
+    t_non_query_elapsed = time.time() - t_non_query_start
+
+    # Query-aware geometries: group pairs by t=max(i,j) for efficiency
+    t_query_aware_start = time.time()
     query_aware_geometries = [
         ('oracle', QueryMahalanobisOracleMetric()),
         ('oracle', ExponentialResponseMetric({'temperature': temp_sqrt_d, 'normalized': True})),
@@ -440,24 +445,29 @@ def run_benchmark_single_head(
             # Store metadata in global dict
             GEOMETRY_METADATA[geom.name] = geom.higher_is_more_similar
 
-            distances_list = []
+            # Accumulate distances on GPU, convert once at end
+            distances_tensor = torch.full((num_actual_pairs,), float('nan'), device=device)
 
+            # Group pairs by t = max(i,j) to reuse query windows
+            pairs_by_t = {}
             for pair_idx in range(num_actual_pairs):
-                i_pos = pairs_np[pair_idx, 0]
-                j_pos = pairs_np[pair_idx, 1]
+                i_pos, j_pos = pairs_np[pair_idx]
                 t = max(i_pos, j_pos)
+                if t not in pairs_by_t:
+                    pairs_by_t[t] = []
+                pairs_by_t[t].append(pair_idx)
 
+            # Process each group with the same query window
+            for t, pair_indices in pairs_by_t.items():
                 if query_mode == 'oracle':
                     # Oracle: use future queries Q[t+1:t+1+future_horizon]
                     future_start = t + 1
                     future_end = min(future_start + future_horizon, seq_len)
                     if future_start < seq_len:
                         Q_window = Q[future_start:future_end, :]
-                        # Extract attention weights for future queries
-                        A_window = A[future_start:future_end, :]  # [num_future, seq_len]
+                        A_window = A[future_start:future_end, :]
                     else:
-                        Q_window = torch.empty(0, d_model, device=device)
-                        A_window = None
+                        continue  # Skip pairs with no future queries
                 elif query_mode == 'causal':
                     # Causal: use past queries Q[max(0, t-window):t]
                     window_size = getattr(geom, 'causal_window', 128)
@@ -465,27 +475,31 @@ def run_benchmark_single_head(
                     past_end = t
                     if past_end > past_start:
                         Q_window = Q[past_start:past_end, :]
-                        # Extract attention weights for past queries
-                        A_window = A[past_start:past_end, :]  # [num_past, seq_len]
+                        A_window = A[past_start:past_end, :]
                     else:
-                        Q_window = torch.empty(0, d_model, device=device)
-                        A_window = None
+                        continue  # Skip pairs with no past queries
                 else:
-                    Q_window = Q  # Fallback (shouldn't happen)
+                    Q_window = Q
                     A_window = A
 
-                # Compute distance for this single pair
+                # Process all pairs with this t value together
                 if Q_window.shape[0] > 0:
-                    pair_single = torch.tensor([[i_pos, j_pos]], dtype=torch.long, device=device)
-                    precomputed = geom.precompute(K, V, queries=Q_window)
-                    distance = geom.compute_pairwise(
-                        K, V, pair_single, queries=Q_window, attentions=A_window, **precomputed
-                    )
-                    distances_list.append(distance[0].item())
-                else:
-                    distances_list.append(np.nan)
+                    # Get pairs for this group
+                    group_pairs_np = pairs_np[pair_indices]
+                    group_pairs_tensor = torch.tensor(group_pairs_np, dtype=torch.long, device=device)
 
-            results[geom.name] = distances_list
+                    # Compute distances for all pairs in this group
+                    precomputed = geom.precompute(K, V, queries=Q_window)
+                    distances_group = geom.compute_pairwise(
+                        K, V, group_pairs_tensor, queries=Q_window, attentions=A_window, **precomputed
+                    )
+
+                    # Store results
+                    for idx, pair_idx in enumerate(pair_indices):
+                        distances_tensor[pair_idx] = distances_group[idx]
+
+            # Convert to CPU once at end
+            results[geom.name] = distances_tensor.cpu().numpy().tolist()
         except Exception as e:
             import traceback
             print(f"ERROR: {geom.name} ({query_mode}) failed with exception:")
@@ -493,117 +507,124 @@ def run_benchmark_single_head(
             print(f"  Traceback: {traceback.format_exc()}")
             results[geom.name] = [np.nan] * num_actual_pairs
 
+    t_query_aware_elapsed = time.time() - t_query_aware_start
+
     # Compute ground truth: future attention similarity
-    # Use only valid future queries: Q[t+1:t+1+future_horizon] where t = max(i,j)
-    # Skip pairs without sufficient future queries
+    # Vectorized: group pairs by t=max(i,j) to batch computation
+    t_future_attn_start = time.time()
     try:
-        future_sims = []
+        # Initialize results as tensor on GPU
+        future_sims_tensor = torch.full((num_actual_pairs,), float('nan'), device=device)
+
+        # Group pairs by t = max(i, j) to reuse query windows
+        pairs_by_t = {}
         for pair_idx in range(num_actual_pairs):
             i_pos = pairs_np[pair_idx, 0]
             j_pos = pairs_np[pair_idx, 1]
-            t = max(i_pos, j_pos)  # Latest position in the pair
-            future_start = t + 1  # First valid future query
+            t = max(i_pos, j_pos)
 
-            # Check if we have minimum future queries
+            if t not in pairs_by_t:
+                pairs_by_t[t] = {'indices': [], 'i_positions': [], 'j_positions': []}
+
+            pairs_by_t[t]['indices'].append(pair_idx)
+            pairs_by_t[t]['i_positions'].append(i_pos)
+            pairs_by_t[t]['j_positions'].append(j_pos)
+
+        # Process each group with the same query window
+        for t, group_data in pairs_by_t.items():
+            future_start = t + 1
             future_end = min(future_start + future_horizon, seq_len)
             num_future = future_end - future_start
 
-            if num_future < min_future_queries:
-                # Skip: insufficient future context
-                future_sims.append(np.nan)
+            if num_future < min_future_queries or future_start >= seq_len:
                 continue
 
-            # Only use queries that occur after the pair exists in cache
-            if future_start < seq_len and future_end > future_start:
-                # Extract attention columns for future queries only
-                attn_col_i = A[future_start:future_start+future_horizon, i_pos]
-                attn_col_j = A[future_start:future_start+future_horizon, j_pos]
+            # Create pairs tensor for this group
+            group_pairs = [[i_pos, j_pos] for i_pos, j_pos in zip(group_data['i_positions'], group_data['j_positions'])]
+            group_pairs_tensor = torch.tensor(group_pairs, dtype=torch.long, device=device)
 
-                sim = torch.nn.functional.cosine_similarity(
-                    attn_col_i.unsqueeze(0),
-                    attn_col_j.unsqueeze(0),
-                    dim=1
-                ).item()
-                future_sims.append(sim)
-            elif future_start < seq_len:
-                # Use whatever future queries we have
-                attn_col_i = A[future_start:seq_len, i_pos]
-                attn_col_j = A[future_start:seq_len, j_pos]
+            # Compute similarity for all pairs in this group at once
+            similarities = compute_future_attention_similarity(
+                A, group_pairs_tensor, future_start, future_horizon
+            )
 
-                if len(attn_col_i) > 0:
-                    sim = torch.nn.functional.cosine_similarity(
-                        attn_col_i.unsqueeze(0),
-                        attn_col_j.unsqueeze(0),
-                        dim=1
-                    ).item()
-                    future_sims.append(sim)
-                else:
-                    future_sims.append(np.nan)
-            else:
-                future_sims.append(np.nan)
+            # Assign results to pairs
+            for idx, pair_idx in enumerate(group_data['indices']):
+                future_sims_tensor[pair_idx] = similarities[idx]
 
-        results['future_attention_similarity'] = future_sims
+        # Convert to CPU numpy once at the end
+        results['future_attention_similarity'] = future_sims_tensor.cpu().numpy().tolist()
     except Exception as e:
         import traceback
         print(f"ERROR: future_attention_similarity failed: {e}")
         print(f"  Traceback: {traceback.format_exc()}")
         results['future_attention_similarity'] = [np.nan] * num_actual_pairs
 
-    # Compute ground truth: deletion damage
-    # Use only valid future queries for each position
-    try:
-        deletion_damage_i = []
-        deletion_damage_j = []
+    t_future_attn_elapsed = time.time() - t_future_attn_start
 
+    # Compute ground truth: deletion damage
+    # Vectorized: group pairs by t=max(i,j) to batch computation
+    t_deletion_start = time.time()
+    try:
+        # Initialize results as tensors on GPU
+        deletion_damage_i_tensor = torch.full((num_actual_pairs,), float('nan'), device=device)
+        deletion_damage_j_tensor = torch.full((num_actual_pairs,), float('nan'), device=device)
+
+        # Group pairs by t = max(i, j) to reuse query windows
+        pairs_by_t = {}
         for pair_idx in range(num_actual_pairs):
             i_pos = pairs_np[pair_idx, 0]
             j_pos = pairs_np[pair_idx, 1]
             t = max(i_pos, j_pos)
-            future_start = t + 1
 
-            # Check minimum future queries
+            if t not in pairs_by_t:
+                pairs_by_t[t] = {'indices': [], 'i_positions': [], 'j_positions': []}
+
+            pairs_by_t[t]['indices'].append(pair_idx)
+            pairs_by_t[t]['i_positions'].append(i_pos)
+            pairs_by_t[t]['j_positions'].append(j_pos)
+
+        # Process each group with the same query window
+        for t, group_data in pairs_by_t.items():
+            future_start = t + 1
             future_end = min(future_start + future_horizon, seq_len)
             num_future = future_end - future_start
 
-            if num_future < min_future_queries:
-                deletion_damage_i.append(np.nan)
-                deletion_damage_j.append(np.nan)
+            if num_future < min_future_queries or future_start >= seq_len:
                 continue
 
-            # Get valid future queries
-            if future_start < seq_len:
-                future_end = min(future_start + future_horizon, seq_len)
-                Q_future = Q[future_start:future_end, :]
-                if Q_future.shape[0] > 0:
-                    # Compute absolute query positions for causal masking
-                    query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
+            Q_future = Q[future_start:future_end, :]
+            if Q_future.shape[0] == 0:
+                continue
 
-                    # Compute deletion damage for position i
-                    pos_i_tensor = torch.tensor([i_pos], dtype=torch.long, device=device)
-                    damage_i = compute_deletion_damage(
-                        K, V, Q_future, pos_i_tensor,
-                        temperature=temp_sqrt_d,
-                        query_positions=query_positions
-                    )
-                    deletion_damage_i.append(damage_i.mean().item())
+            query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
 
-                    # Compute deletion damage for position j
-                    pos_j_tensor = torch.tensor([j_pos], dtype=torch.long, device=device)
-                    damage_j = compute_deletion_damage(
-                        K, V, Q_future, pos_j_tensor,
-                        temperature=temp_sqrt_d,
-                        query_positions=query_positions
-                    )
-                    deletion_damage_j.append(damage_j.mean().item())
-                else:
-                    deletion_damage_i.append(np.nan)
-                    deletion_damage_j.append(np.nan)
-            else:
-                deletion_damage_i.append(np.nan)
-                deletion_damage_j.append(np.nan)
+            # Combine all unique positions for this group
+            all_positions = list(set(group_data['i_positions'] + group_data['j_positions']))
+            positions_tensor = torch.tensor(all_positions, dtype=torch.long, device=device)
 
-        results['deletion_damage_i'] = deletion_damage_i
-        results['deletion_damage_j'] = deletion_damage_j
+            # Compute deletion damage for all positions at once
+            # Returns: [num_queries, num_positions]
+            damage_all = compute_deletion_damage(
+                K, V, Q_future, positions_tensor,
+                temperature=temp_sqrt_d,
+                query_positions=query_positions
+            )
+
+            # Average over queries: [num_positions]
+            damage_avg = damage_all.mean(dim=0)
+
+            # Create position -> damage index mapping
+            pos_to_idx = {pos: idx for idx, pos in enumerate(all_positions)}
+
+            # Assign results to pairs
+            for pair_idx, i_pos, j_pos in zip(group_data['indices'], group_data['i_positions'], group_data['j_positions']):
+                deletion_damage_i_tensor[pair_idx] = damage_avg[pos_to_idx[i_pos]]
+                deletion_damage_j_tensor[pair_idx] = damage_avg[pos_to_idx[j_pos]]
+
+        # Convert to CPU numpy once at the end
+        results['deletion_damage_i'] = deletion_damage_i_tensor.cpu().numpy().tolist()
+        results['deletion_damage_j'] = deletion_damage_j_tensor.cpu().numpy().tolist()
     except Exception as e:
         import traceback
         print(f"ERROR: deletion_damage failed: {e}")
@@ -611,52 +632,70 @@ def run_benchmark_single_head(
         results['deletion_damage_i'] = [np.nan] * num_actual_pairs
         results['deletion_damage_j'] = [np.nan] * num_actual_pairs
 
+    t_deletion_elapsed = time.time() - t_deletion_start
+
     # Compute ground truth: merge damage
-    # Use only valid future queries
+    # Vectorized: group pairs by t=max(i,j) to batch computation
+    t_merge_start = time.time()
     try:
-        merge_damages = []
+        # Initialize results as tensor on GPU
+        merge_damage_tensor = torch.full((num_actual_pairs,), float('nan'), device=device)
 
-        for pair_idx in range(num_actual_pairs):
-            i_pos = pairs_np[pair_idx, 0]
-            j_pos = pairs_np[pair_idx, 1]
-            t = max(i_pos, j_pos)
+        # Reuse pairs_by_t grouping from deletion damage
+        # Process each group with the same query window
+        for t, group_data in pairs_by_t.items():
             future_start = t + 1
-
-            # Check minimum future queries
             future_end = min(future_start + future_horizon, seq_len)
             num_future = future_end - future_start
 
-            if num_future < min_future_queries:
-                merge_damages.append(np.nan)
+            if num_future < min_future_queries or future_start >= seq_len:
                 continue
 
-            # Get valid future queries
-            if future_start < seq_len:
-                future_end = min(future_start + future_horizon, seq_len)
-                Q_future = Q[future_start:future_end, :]
-                if Q_future.shape[0] > 0:
-                    # Compute absolute query positions for causal masking
-                    query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
+            Q_future = Q[future_start:future_end, :]
+            if Q_future.shape[0] == 0:
+                continue
 
-                    # Compute merge damage for this pair
-                    pair_tensor = torch.tensor([[i_pos, j_pos]], dtype=torch.long, device=device)
-                    damage = compute_merge_damage(
-                        K, V, Q_future, pair_tensor,
-                        temperature=temp_sqrt_d,
-                        query_positions=query_positions
-                    )
-                    merge_damages.append(damage.mean().item())
-                else:
-                    merge_damages.append(np.nan)
-            else:
-                merge_damages.append(np.nan)
+            query_positions = torch.arange(future_start, future_end, dtype=torch.long, device=device)
 
-        results['merge_damage'] = merge_damages
+            # Create pairs tensor for this group
+            group_pairs = [[i_pos, j_pos] for i_pos, j_pos in zip(group_data['i_positions'], group_data['j_positions'])]
+            group_pairs_tensor = torch.tensor(group_pairs, dtype=torch.long, device=device)
+
+            # Compute merge damage for all pairs in this group at once
+            # Returns: [num_queries, num_pairs_in_group]
+            damage_all = compute_merge_damage(
+                K, V, Q_future, group_pairs_tensor,
+                temperature=temp_sqrt_d,
+                query_positions=query_positions
+            )
+
+            # Average over queries: [num_pairs_in_group]
+            damage_avg = damage_all.mean(dim=0)
+
+            # Assign results to pairs
+            for idx, pair_idx in enumerate(group_data['indices']):
+                merge_damage_tensor[pair_idx] = damage_avg[idx]
+
+        # Convert to CPU numpy once at the end
+        results['merge_damage'] = merge_damage_tensor.cpu().numpy().tolist()
     except Exception as e:
         import traceback
         print(f"ERROR: merge_damage failed: {e}")
         print(f"  Traceback: {traceback.format_exc()}")
         results['merge_damage'] = [np.nan] * num_actual_pairs
+
+    t_merge_elapsed = time.time() - t_merge_start
+    t_total = time.time() - t_start
+
+    # Print timing summary on first sample
+    if sample_id == 0:
+        print(f"\nTiming (sample {sample_id}, head {head_idx}):")
+        print(f"  Non-query geometries: {t_non_query_elapsed:.3f}s")
+        print(f"  Query-aware geometries: {t_query_aware_elapsed:.3f}s")
+        print(f"  Future attention similarity: {t_future_attn_elapsed:.3f}s")
+        print(f"  Deletion damage: {t_deletion_elapsed:.3f}s")
+        print(f"  Merge damage: {t_merge_elapsed:.3f}s")
+        print(f"  Total: {t_total:.3f}s")
 
     return pd.DataFrame(results)
 

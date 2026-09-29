@@ -68,29 +68,29 @@ def compute_deletion_damage(
     # [num_queries, seq_len] @ [seq_len, d_model] = [num_queries, d_model]
     output_original = attentions @ values  # [num_queries, d_model]
 
-    # Compute damage for specified positions
+    # Vectorized computation for all positions
     num_positions = positions.shape[0]
-    damage = torch.zeros(num_queries, num_positions, device=device)
 
-    for idx, pos in enumerate(positions):
-        pos_idx = pos.item()
+    # Get attention weights for all positions: [num_queries, num_positions]
+    a_j = attentions[:, positions]  # [num_queries, num_positions]
 
-        # Get attention weight and value for this position
-        a_j = attentions[:, pos_idx]  # [num_queries]
-        v_j = values[pos_idx]  # [d_model]
+    # Get values for all positions: [num_positions, d_model]
+    v_j = values[positions]  # [num_positions, d_model]
 
-        # Closed-form damage: a_j / (1 - a_j) * ||v_j - o||
-        # Broadcast v_j to match output_original shape
-        v_j_expanded = v_j.unsqueeze(0)  # [1, d_model]
-        diff = v_j_expanded - output_original  # [num_queries, d_model]
-        diff_norm = torch.norm(diff, p=2, dim=1)  # [num_queries]
+    # Compute ||v_j - o|| for all positions
+    # v_j: [num_positions, d_model], output_original: [num_queries, d_model]
+    # Need: [num_queries, num_positions, d_model]
+    v_j_expanded = v_j.unsqueeze(0)  # [1, num_positions, d_model]
+    output_expanded = output_original.unsqueeze(1)  # [num_queries, 1, d_model]
+    diff = v_j_expanded - output_expanded  # [num_queries, num_positions, d_model]
+    diff_norm = torch.norm(diff, p=2, dim=2)  # [num_queries, num_positions]
 
-        # Handle case where a_j ≈ 1 (numerical protection)
-        # When a_j → 1, damage → infinity, but we clip it
-        a_j_safe = torch.clamp(a_j, 0.0, 0.9999)  # prevent division by zero
-        damage_factor = a_j_safe / (1 - a_j_safe)  # [num_queries]
+    # Damage factor: a_j / (1 - a_j), with numerical protection
+    a_j_safe = torch.clamp(a_j, 0.0, 0.9999)  # [num_queries, num_positions]
+    damage_factor = a_j_safe / (1 - a_j_safe)  # [num_queries, num_positions]
 
-        damage[:, idx] = damage_factor * diff_norm
+    # Final damage
+    damage = damage_factor * diff_norm  # [num_queries, num_positions]
 
     return damage
 
@@ -107,7 +107,14 @@ def compute_merge_damage(
     """
     Compute damage from merging pairs of tokens.
 
-    Simulates replacing positions i and j with a single merged token.
+    Uses exact closed-form formula without reconstructing KV cache:
+        For merging i and j:
+        z_m = (z_i + z_j)/2  (merged logit)
+        w_m = exp(z_m)       (merged unnormalized weight)
+        Z' = Z - w_i - w_j + w_m
+        N' = N - w_i*v_i - w_j*v_j + w_m*v_m
+        o' = N'/Z'
+        damage = ||o - o'||
 
     Merge strategies:
     - 'average': k_merged = (k_i + k_j)/2, v_merged = (v_i + v_j)/2
@@ -134,7 +141,10 @@ def compute_merge_damage(
     if temperature is None:
         temperature = math.sqrt(d_model)
 
-    # Compute original attention and output
+    if merge_strategy != 'average':
+        raise ValueError(f"Only 'average' merge_strategy is supported, got: {merge_strategy}")
+
+    # Compute original logits and attention
     logits = queries @ keys.T / temperature  # [num_queries, seq_len]
 
     # Apply causal mask if query_positions provided
@@ -144,85 +154,79 @@ def compute_merge_damage(
         causal_mask = key_positions > query_pos_expanded  # [num_queries, seq_len]
         logits = logits.masked_fill(causal_mask, float('-inf'))
 
-    attentions = F.softmax(logits, dim=1)  # [num_queries, seq_len]
-    output_original = attentions @ values  # [num_queries, d_model]
+    # For numerical stability, use log-sum-exp trick
+    # Store max logit for each query for later use
+    max_logits = logits.max(dim=1, keepdim=True).values  # [num_queries, 1]
 
-    damage = torch.zeros(num_queries, num_pairs, device=device)
+    # Compute unnormalized weights (shifted by max for stability)
+    logits_shifted = logits - max_logits  # [num_queries, seq_len]
+    unnorm_weights = torch.exp(logits_shifted)  # [num_queries, seq_len]
 
-    for pair_idx in range(num_pairs):
-        i_pos_raw = pairs[pair_idx, 0].item()
-        j_pos_raw = pairs[pair_idx, 1].item()
+    # Compute normalization constant Z
+    Z = unnorm_weights.sum(dim=1, keepdim=True)  # [num_queries, 1]
 
-        # Canonicalize pair: ensure i < j
-        i_pos = min(i_pos_raw, j_pos_raw)
-        j_pos = max(i_pos_raw, j_pos_raw)
+    # Compute original output: N = sum_k w_k v_k
+    N = unnorm_weights @ values  # [num_queries, d_model]
+    output_original = N / Z  # [num_queries, d_model]
 
-        # Get keys and values
-        ki = keys[i_pos]  # [d_model]
-        kj = keys[j_pos]  # [d_model]
-        vi = values[i_pos]  # [d_model]
-        vj = values[j_pos]  # [d_model]
+    # Vectorized computation for all pairs
+    # Canonicalize pairs: ensure i < j
+    pairs_np = pairs.cpu().numpy()
+    i_positions = torch.minimum(pairs[:, 0], pairs[:, 1])  # [num_pairs]
+    j_positions = torch.maximum(pairs[:, 0], pairs[:, 1])  # [num_pairs]
 
-        if merge_strategy == 'average':
-            # Simple average
-            k_merged = (ki + kj) / 2
-            v_merged = (vi + vj) / 2
+    # Get logits for positions i and j: [num_queries, num_pairs]
+    z_i = logits_shifted[:, i_positions]  # [num_queries, num_pairs]
+    z_j = logits_shifted[:, j_positions]  # [num_queries, num_pairs]
 
-            # Create merged keys/values
-            # Replace position i with merged, remove position j
-            # This reduces sequence length by exactly 1
-            keys_merged = torch.cat([
-                keys[:i_pos],
-                k_merged.unsqueeze(0),
-                keys[i_pos+1:j_pos],
-                keys[j_pos+1:],
-            ], dim=0)  # [seq_len - 1, d_model]
+    # Compute merged logit (average in original space, then shift)
+    # z_merged_orig = (z_i_orig + z_j_orig) / 2
+    # z_i_orig = z_i + max_logits, z_j_orig = z_j + max_logits
+    # z_merged_orig = (z_i + z_j) / 2 + max_logits
+    # z_merged_shifted = z_merged_orig - max_logits = (z_i + z_j) / 2
+    z_m = (z_i + z_j) / 2  # [num_queries, num_pairs]
 
-            values_merged = torch.cat([
-                values[:i_pos],
-                v_merged.unsqueeze(0),
-                values[i_pos+1:j_pos],
-                values[j_pos+1:],
-            ], dim=0)  # [seq_len - 1, d_model]
+    # Compute unnormalized weights
+    w_i = torch.exp(z_i)  # [num_queries, num_pairs]
+    w_j = torch.exp(z_j)  # [num_queries, num_pairs]
+    w_m = torch.exp(z_m)  # [num_queries, num_pairs]
 
-            # Verify we reduced length by exactly 1
-            assert keys_merged.shape[0] == seq_len - 1, \
-                f"Merge failed: expected {seq_len-1}, got {keys_merged.shape[0]}"
+    # Get values for positions i and j
+    v_i = values[i_positions]  # [num_pairs, d_model]
+    v_j = values[j_positions]  # [num_pairs, d_model]
+    v_m = (v_i + v_j) / 2  # [num_pairs, d_model]
 
-        else:
-            raise ValueError(f"Unknown merge_strategy: {merge_strategy}")
+    # Compute adjusted normalization: Z' = Z - w_i - w_j + w_m
+    # Z: [num_queries, 1], w_i/w_j/w_m: [num_queries, num_pairs]
+    Z_adjusted = Z - w_i - w_j + w_m  # [num_queries, num_pairs]
 
-        # Recompute attention with merged cache
-        logits_merged = queries @ keys_merged.T / temperature  # [num_queries, seq_len-1]
+    # Compute adjusted numerator: N' = N - w_i*v_i - w_j*v_j + w_m*v_m
+    # N: [num_queries, d_model]
+    # w_i: [num_queries, num_pairs], v_i: [num_pairs, d_model]
+    # w_i * v_i needs broadcasting: [num_queries, num_pairs, 1] * [1, num_pairs, d_model]
+    w_i_expanded = w_i.unsqueeze(2)  # [num_queries, num_pairs, 1]
+    w_j_expanded = w_j.unsqueeze(2)  # [num_queries, num_pairs, 1]
+    w_m_expanded = w_m.unsqueeze(2)  # [num_queries, num_pairs, 1]
 
-        # Apply causal mask to merged logits if query_positions provided
-        if query_positions is not None:
-            # After merging i and j (i < j), the new key positions are:
-            # - Positions 0 to i-1: unchanged
-            # - Position i: merged (originally positions i and j)
-            # - Positions i+1 to j-1: unchanged
-            # - Positions j onwards: shifted left by 1 (originally j+1 onwards)
+    v_i_expanded = v_i.unsqueeze(0)  # [1, num_pairs, d_model]
+    v_j_expanded = v_j.unsqueeze(0)  # [1, num_pairs, d_model]
+    v_m_expanded = v_m.unsqueeze(0)  # [1, num_pairs, d_model]
 
-            # Create mapping of merged key positions to original positions
-            merged_key_positions = torch.cat([
-                torch.arange(i_pos, device=device),  # 0 to i-1
-                torch.tensor([i_pos], device=device),  # merged key at position i
-                torch.arange(i_pos + 1, j_pos, device=device),  # i+1 to j-1
-                torch.arange(j_pos + 1, seq_len, device=device),  # j+1 onwards (original positions)
-            ])  # [seq_len - 1]
+    # N: [num_queries, d_model] -> [num_queries, 1, d_model]
+    N_expanded = N.unsqueeze(1)  # [num_queries, 1, d_model]
 
-            # Apply causal mask: query at position q attends only to keys with original position <= q
-            query_pos_expanded = query_positions.unsqueeze(1)  # [num_queries, 1]
-            merged_key_pos_expanded = merged_key_positions.unsqueeze(0)  # [1, seq_len-1]
-            causal_mask_merged = merged_key_pos_expanded > query_pos_expanded  # [num_queries, seq_len-1]
-            logits_merged = logits_merged.masked_fill(causal_mask_merged, float('-inf'))
+    # Compute adjustment
+    N_adjusted = N_expanded - w_i_expanded * v_i_expanded - w_j_expanded * v_j_expanded + w_m_expanded * v_m_expanded
+    # [num_queries, num_pairs, d_model]
 
-        attentions_merged = F.softmax(logits_merged, dim=1)  # [num_queries, seq_len-1]
-        output_merged = attentions_merged @ values_merged  # [num_queries, d_model]
+    # Compute merged output: o' = N' / Z'
+    Z_adjusted_expanded = Z_adjusted.unsqueeze(2)  # [num_queries, num_pairs, 1]
+    output_merged = N_adjusted / Z_adjusted_expanded  # [num_queries, num_pairs, d_model]
 
-        # Compute damage: ||output_original - output_merged||
-        diff = output_original - output_merged  # [num_queries, d_model]
-        damage[:, pair_idx] = torch.norm(diff, p=2, dim=1)  # [num_queries]
+    # Compute damage: ||o - o'||
+    output_original_expanded = output_original.unsqueeze(1)  # [num_queries, 1, d_model]
+    diff = output_original_expanded - output_merged  # [num_queries, num_pairs, d_model]
+    damage = torch.norm(diff, p=2, dim=2)  # [num_queries, num_pairs]
 
     return damage
 
@@ -264,26 +268,28 @@ def compute_future_attention_similarity(
     # Extract future attention window
     attn_future = attentions[future_start:future_end, :]  # [horizon, seq_len]
 
+    # Extract attention columns for all pairs
+    # pairs[:, 0]: [num_pairs], pairs[:, 1]: [num_pairs]
+    attn_col_i = attn_future[:, pairs[:, 0]]  # [horizon, num_pairs]
+    attn_col_j = attn_future[:, pairs[:, 1]]  # [horizon, num_pairs]
+
+    # Compute cosine similarity for all pairs
+    # F.cosine_similarity expects [N, d] shapes, computes similarity along dim
+    # Transpose to [num_pairs, horizon]
+    attn_col_i_T = attn_col_i.T  # [num_pairs, horizon]
+    attn_col_j_T = attn_col_j.T  # [num_pairs, horizon]
+
+    # Compute norms
+    norm_i = torch.norm(attn_col_i_T, p=2, dim=1)  # [num_pairs]
+    norm_j = torch.norm(attn_col_j_T, p=2, dim=1)  # [num_pairs]
+
+    # Compute dot products
+    dot_products = (attn_col_i_T * attn_col_j_T).sum(dim=1)  # [num_pairs]
+
+    # Compute cosine similarity with protection against zero norms
     similarities = torch.zeros(num_pairs, device=device)
-
-    for pair_idx in range(num_pairs):
-        i_pos = pairs[pair_idx, 0].item()
-        j_pos = pairs[pair_idx, 1].item()
-
-        # Extract attention columns for positions i and j
-        attn_col_i = attn_future[:, i_pos]  # [horizon]
-        attn_col_j = attn_future[:, j_pos]  # [horizon]
-
-        # Compute cosine similarity
-        if attn_col_i.sum() == 0 or attn_col_j.sum() == 0:
-            similarities[pair_idx] = 0.0
-        else:
-            sim = F.cosine_similarity(
-                attn_col_i.unsqueeze(0),
-                attn_col_j.unsqueeze(0),
-                dim=1
-            )
-            similarities[pair_idx] = sim.item()
+    valid_mask = (norm_i > 0) & (norm_j > 0)
+    similarities[valid_mask] = dot_products[valid_mask] / (norm_i[valid_mask] * norm_j[valid_mask])
 
     return similarities
 
