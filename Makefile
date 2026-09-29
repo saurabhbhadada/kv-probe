@@ -98,7 +98,7 @@ test:
 
 test-geometry:
 	@echo "Running geometry tests..."
-	$(DOCKER_RUN) pytest tests/test_geometries.py -v
+	$(DOCKER_RUN) pytest tests/test_geometries.py tests/test_vectorized_ground_truth.py -v
 
 # Data operations
 download:

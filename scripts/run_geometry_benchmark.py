@@ -494,9 +494,9 @@ def run_benchmark_single_head(
                         K, V, group_pairs_tensor, queries=Q_window, attentions=A_window, **precomputed
                     )
 
-                    # Store results
-                    for idx, pair_idx in enumerate(pair_indices):
-                        distances_tensor[pair_idx] = distances_group[idx]
+                    # Store results (vectorized assignment)
+                    pair_indices_tensor = torch.as_tensor(pair_indices, device=device, dtype=torch.long)
+                    distances_tensor[pair_indices_tensor] = distances_group
 
             # Convert to CPU once at end
             results[geom.name] = distances_tensor.cpu().numpy().tolist()
@@ -548,9 +548,9 @@ def run_benchmark_single_head(
                 A, group_pairs_tensor, future_start, future_horizon
             )
 
-            # Assign results to pairs
-            for idx, pair_idx in enumerate(group_data['indices']):
-                future_sims_tensor[pair_idx] = similarities[idx]
+            # Assign results to pairs (vectorized assignment)
+            indices_tensor = torch.as_tensor(group_data['indices'], device=device, dtype=torch.long)
+            future_sims_tensor[indices_tensor] = similarities
 
         # Convert to CPU numpy once at the end
         results['future_attention_similarity'] = future_sims_tensor.cpu().numpy().tolist()
@@ -617,10 +617,15 @@ def run_benchmark_single_head(
             # Create position -> damage index mapping
             pos_to_idx = {pos: idx for idx, pos in enumerate(all_positions)}
 
-            # Assign results to pairs
-            for pair_idx, i_pos, j_pos in zip(group_data['indices'], group_data['i_positions'], group_data['j_positions']):
-                deletion_damage_i_tensor[pair_idx] = damage_avg[pos_to_idx[i_pos]]
-                deletion_damage_j_tensor[pair_idx] = damage_avg[pos_to_idx[j_pos]]
+            # Vectorized assignment
+            pair_indices_tensor = torch.as_tensor(group_data['indices'], device=device, dtype=torch.long)
+            # Map i_positions and j_positions to damage indices
+            i_damage_indices = torch.tensor([pos_to_idx[i_pos] for i_pos in group_data['i_positions']],
+                                           device=device, dtype=torch.long)
+            j_damage_indices = torch.tensor([pos_to_idx[j_pos] for j_pos in group_data['j_positions']],
+                                           device=device, dtype=torch.long)
+            deletion_damage_i_tensor[pair_indices_tensor] = damage_avg[i_damage_indices]
+            deletion_damage_j_tensor[pair_indices_tensor] = damage_avg[j_damage_indices]
 
         # Convert to CPU numpy once at the end
         results['deletion_damage_i'] = deletion_damage_i_tensor.cpu().numpy().tolist()
@@ -672,9 +677,9 @@ def run_benchmark_single_head(
             # Average over queries: [num_pairs_in_group]
             damage_avg = damage_all.mean(dim=0)
 
-            # Assign results to pairs
-            for idx, pair_idx in enumerate(group_data['indices']):
-                merge_damage_tensor[pair_idx] = damage_avg[idx]
+            # Assign results to pairs (vectorized assignment)
+            indices_tensor = torch.as_tensor(group_data['indices'], device=device, dtype=torch.long)
+            merge_damage_tensor[indices_tensor] = damage_avg
 
         # Convert to CPU numpy once at the end
         results['merge_damage'] = merge_damage_tensor.cpu().numpy().tolist()
@@ -776,8 +781,6 @@ def main():
 
     # Clean up first sample
     del sample_data_first
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # Process samples one at a time
     print(f"\nProcessing samples and benchmarking...")
@@ -814,10 +817,6 @@ def main():
 
         # Explicitly delete tensors to free memory
         del sample_data, keys_layer, values_layer, queries_layer, attns_layer
-
-        # Clear GPU cache after each sample
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     # Combine all results
     if len(all_results) == 0:

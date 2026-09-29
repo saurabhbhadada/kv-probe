@@ -171,7 +171,6 @@ def compute_merge_damage(
 
     # Vectorized computation for all pairs
     # Canonicalize pairs: ensure i < j
-    pairs_np = pairs.cpu().numpy()
     i_positions = torch.minimum(pairs[:, 0], pairs[:, 1])  # [num_pairs]
     j_positions = torch.maximum(pairs[:, 0], pairs[:, 1])  # [num_pairs]
 
